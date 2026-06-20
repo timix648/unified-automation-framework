@@ -214,7 +214,3 @@ and account changes — are written to the audit log.
 ## License
 
 Released under the MIT License. See the LICENSE file for details.
-
-## Author
-
-Meshioye Timilehin. Final-year network engineering project.

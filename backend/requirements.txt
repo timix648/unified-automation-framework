@@ -1,0 +1,78 @@
+# Core Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Network Automation - CRITICAL ADDITIONS
+netmiko==4.3.0
+paramiko==3.4.0
+nornir==3.4.1
+nornir-netmiko==1.0.1
+#nornir-napalm==0.5.0
+nornir-utils==0.2.0
+#napalm==4.1.0
+
+# MikroTik RouterOS API - CRITICAL ADDITION (mikrotik_driver.py imports this)
+routeros_api==0.17.0
+
+# SNMP - CRITICAL ADDITION
+pysnmp==4.4.12
+
+# MQTT for WoL Bridge - CRITICAL ADDITION
+paho-mqtt==1.6.1
+
+# Wake-on-LAN
+wakeonlan==3.1.0
+
+# Monitoring - CRITICAL ADDITION
+prometheus-client==0.19.0
+
+# HTTP Clients
+requests==2.31.0
+httpx==0.26.0
+
+# Flask (used by WoL Bridge Agent REST mode)
+flask==3.0.0
+
+# Background Task Scheduling
+APScheduler==3.10.4
+
+# Security & Authentication
+python-jose[cryptography]==3.3.0
+# passlib removed — bcrypt is called directly (passlib 1.7.4 is unmaintained
+# and triggers a bcrypt version-probe warning on Python 3.12+).
+bcrypt>=4.1
+
+# Database Clients (for NetBox)
+pynetbox==7.3.3
+
+# Data Serialization
+pyyaml==6.0.1
+
+# FIX: Removed asyncio==3.4.3 — asyncio is built into Python 3.4+
+# Installing it via pip causes: "ERROR: No matching distribution found"
+
+# Logging
+colorlog==6.8.0
+
+# Testing (Optional)
+pytest==7.4.4
+pytest-asyncio==0.23.3
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+
+# Type Checking (Development)
+mypy==1.8.0
+
+# Code Quality (Development)
+black==23.12.1
+flake8==7.0.0
+isort==5.13.2
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.5.3

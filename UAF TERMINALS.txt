@@ -1,0 +1,4 @@
+PS C:\Users\hp\Downloads\UAF\backend> python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+
+PS C:\Users\hp\Downloads\UAF\frontend> python -m reflex run --backend-port 8001

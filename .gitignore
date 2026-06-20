@@ -1,0 +1,57 @@
+﻿# Secrets — NEVER commit
+.env
+*.env
+!.env.example
+!.env.prod.example
+backend/.env
+frontend/.env
+
+# Claude Code / AI tooling config
+.claude/
+.claude.json
+CLAUDE.md
+
+# Large dumps / generated
+uaf.xml
+repomix-output.xml
+.repomixignore
+
+# Documents (report & slides)
+*.docx
+*.pptx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Reflex
+.web/
+.states/
+
+# Databases & local data
+*.db
+*.sqlite3
+enforcement_state.json
+
+# Reflex/Node assets
+assets/external/
+node_modules/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Docker volumes (local)
+postgres-data/
+redis-data/
+netbox-*/

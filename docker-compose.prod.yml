@@ -1,0 +1,92 @@
+# ===========================================================================
+# UAF — Production Deployment (Report 4.3)
+# ===========================================================================
+# Deploys the UAF engine on a cloud VM and bridges it to the physical lab
+# devices over a Tailscale mesh, so the cloud-hosted backend can reach
+# 192.168.x.x lab hardware that lives behind a home/campus NAT.
+#
+#   [ Cloud VM ]                              [ Lab network 192.168.1.0/24 ]
+#   backend  ─┐                               ┌─ Cisco  192.168.1.10
+#   frontend  ├─ tailscale (this file) ◀────▶ ├─ MikroTik 192.168.1.20
+#   netbox*  ─┘        tailnet               └─ UniFi  192.168.1.30
+#
+#   * On the lab side you run ONE Tailscale "subnet router" advertising
+#     192.168.1.0/24 (see infra/DEPLOY.md). The backend container shares the
+#     tailscale sidecar's network namespace, so its outbound device
+#     connections route over the tailnet to that subnet router.
+#
+# Bring up:   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+# Tear down:  docker compose -f docker-compose.prod.yml down
+# ===========================================================================
+
+services:
+
+  # --- Tailscale mesh sidecar -------------------------------------------------
+  # Joins the tailnet, accepts the lab subnet routes, and publishes the backend
+  # API port. The backend shares this namespace (network_mode below).
+  tailscale:
+    image: tailscale/tailscale:latest
+    hostname: uaf-cloud
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}            # reusable/ephemeral key from the Tailscale admin console
+      - TS_EXTRA_ARGS=--accept-routes       # accept the lab subnet route advertised by the lab router
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_USERSPACE=false
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    ports:
+      - "8000:8000"        # backend API (published here because backend shares this netns)
+    restart: unless-stopped
+
+  # --- UAF backend (FastAPI) --------------------------------------------------
+  backend:
+    build: ./backend
+    # Share the tailscale netns so device traffic (192.168.1.x) routes over the mesh.
+    network_mode: "service:tailscale"
+    env_file:
+      - .env.prod
+    depends_on:
+      - tailscale
+    restart: unless-stopped
+
+  # --- UAF frontend (Reflex console) ------------------------------------------
+  frontend:
+    build: ./frontend
+    environment:
+      # Point the UI + WebSocket channel at the backend via the tailnet/host.
+      - API_BASE=${PUBLIC_API_BASE}
+    ports:
+      - "3000:3000"
+      - "8001:8001"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # --- NetBox Single Source of Truth (optional) -------------------------------
+  # NetBox is heavy (needs Postgres + Redis). Many deployments run it
+  # separately and just point NETBOX_URL/NETBOX_TOKEN at it. Uncomment to run
+  # it here. The backend falls back to its built-in inventory if NetBox is
+  # absent, so this is not required to bring the engine up.
+  #
+  # netbox:
+  #   image: netboxcommunity/netbox:latest
+  #   depends_on: [netbox-postgres, netbox-redis]
+  #   environment:
+  #     - DB_HOST=netbox-postgres
+  #     - REDIS_HOST=netbox-redis
+  #   ports: ["8080:8080"]
+  #   restart: unless-stopped
+  # netbox-postgres:
+  #   image: postgres:16-alpine
+  #   environment: [POSTGRES_DB=netbox, POSTGRES_USER=netbox, POSTGRES_PASSWORD=${NETBOX_DB_PASSWORD}]
+  #   volumes: ["netbox-db:/var/lib/postgresql/data"]
+  # netbox-redis:
+  #   image: redis:7-alpine
+
+volumes:
+  tailscale-state:
+  # netbox-db:

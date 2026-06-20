@@ -1,0 +1,26 @@
+# Prometheus scrape config for UAF.
+# The backend already exposes Prometheus metrics at /metrics (see
+# app/services/metrics.py). This wires a scraper to it. To actually run it,
+# add a `prometheus` service to the compose file using this config, e.g.:
+#
+#   prometheus:
+#     image: prom/prometheus:latest
+#     volumes:
+#       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+#     ports: ["9090:9090"]
+#     networks: [uaf-network]
+#
+# Grafana (infra/grafana) on top of this is Chapter 5.3 future work — optional.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: uaf-backend
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["uaf-backend:8000"]
+        labels:
+          service: uaf
+          component: backend

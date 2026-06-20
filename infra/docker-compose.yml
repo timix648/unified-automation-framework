@@ -1,0 +1,184 @@
+# ============================================================================
+# UAF Complete Stack - Docker Compose (DEV / LOCAL)
+# ============================================================================
+# Deploys, for local development:
+#   - UAF Backend API        (MOCK_MODE=True by default)
+#   - UAF Frontend (Reflex)  console UI
+#   - NetBox (Source of Truth) + PostgreSQL + Redis
+#
+# For the cloud + Tailscale deployment, use ../docker-compose.prod.yml instead
+# (see ../infra/DEPLOY.md, Report 4.3).
+#
+# NOTE on build contexts: paths below (./backend, ./frontend) are written
+# relative to the REPO ROOT. Run from the repo root, e.g.:
+#     docker compose -f infra/docker-compose.yml up -d --build
+# If your Compose resolves contexts relative to this file's folder instead,
+# change ./backend -> ../backend and ./frontend -> ../frontend.
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # UAF Backend API
+  # ==========================================================================
+  uaf-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: uaf-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PROJECT_NAME=UAF - Unified Automation Framework
+      - VERSION=1.0.0
+      - MOCK_MODE=False
+      - NETBOX_URL=http://netbox:8080
+      - NETBOX_TOKEN=${NETBOX_TOKEN:-0123456789abcdef0123456789abcdef01234567}
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/logs:/app/logs
+      - ./backend/.env:/app/.env
+    depends_on:
+      - netbox
+    networks:
+      - uaf-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ==========================================================================
+  # UAF Frontend (Reflex operations console)
+  # ==========================================================================
+  uaf-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: uaf-frontend
+    ports:
+      - "3000:3000"   # web UI
+      - "8001:8001"   # Reflex state server
+    environment:
+      # Server-side State code (httpx + the WebSocket alert feed) runs inside
+      # this container, so it reaches the backend by its compose service name.
+      - API_BASE=http://uaf-backend:8000/api
+    depends_on:
+      - uaf-backend
+    networks:
+      - uaf-network
+    restart: unless-stopped
+
+  # ==========================================================================
+  # NetBox - Network Source of Truth
+  # ==========================================================================
+  netbox:
+    image: netboxcommunity/netbox:v3.7
+    container_name: uaf-netbox
+    ports:
+      - "8080:8080"
+    environment:
+      - SUPERUSER_NAME=admin
+      - SUPERUSER_EMAIL=admin@example.com
+      - SUPERUSER_PASSWORD=admin
+      - SUPERUSER_API_TOKEN=${NETBOX_TOKEN:-0123456789abcdef0123456789abcdef01234567}
+      - ALLOWED_HOSTS=*
+      - DB_HOST=postgres
+      - DB_NAME=netbox
+      - DB_USER=netbox
+      - DB_PASSWORD=netbox_password
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - SECRET_KEY=uaf_netbox_secret_key_minimum_fifty_characters_long_0123456789
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - netbox-media:/opt/netbox/netbox/media
+      - netbox-reports:/opt/netbox/netbox/reports
+      - netbox-scripts:/opt/netbox/netbox/scripts
+    networks:
+      - uaf-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ==========================================================================
+  # PostgreSQL - Database for NetBox
+  # ==========================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: uaf-postgres
+    environment:
+      - POSTGRES_DB=netbox
+      - POSTGRES_USER=netbox
+      - POSTGRES_PASSWORD=netbox_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - uaf-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netbox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================================================
+  # Redis - Cache for NetBox
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: uaf-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - uaf-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  uaf-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+
+# ============================================================================
+# Volumes (Persistent Storage)
+# ============================================================================
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  netbox-media:
+    driver: local
+  netbox-reports:
+    driver: local
+  netbox-scripts:
+    driver: local
+
+# ============================================================================
+# Usage
+# ============================================================================
+# Start (from repo root):  docker compose -f infra/docker-compose.yml up -d --build
+# Logs:                     docker compose -f infra/docker-compose.yml logs -f uaf-backend
+# Access:                   UI http://localhost:3000  ·  API http://localhost:8000
+#                           NetBox http://localhost:8080 (admin/admin)
+# Stop:                     docker compose -f infra/docker-compose.yml down
+# Stop + wipe data:         docker compose -f infra/docker-compose.yml down -v
+# ============================================================================

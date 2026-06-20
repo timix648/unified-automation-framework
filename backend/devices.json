@@ -1,0 +1,32 @@
+[
+  {
+    "name": "cisco-switch-01",
+    "ip": "192.168.1.10",
+    "primary_ip": "192.168.1.10",
+    "platform": "cisco_ios",
+    "device_role": "switch",
+    "site": "home-lab",
+    "manufacturer": "Cisco",
+    "mac": "00:1A:2B:3C:4D:5E"
+  },
+  {
+    "name": "mikrotik-router-01",
+    "ip": "192.168.1.20",
+    "primary_ip": "192.168.1.20",
+    "platform": "mikrotik_routeros",
+    "device_role": "edge-router",
+    "site": "home-lab",
+    "manufacturer": "MikroTik",
+    "mac": "6C:3B:6B:AA:BB:CC"
+  },
+  {
+    "name": "unifi-ap-01",
+    "ip": "127.0.0.1",
+    "primary_ip": "127.0.0.1",
+    "platform": "unifi",
+    "device_role": "access-point",
+    "site": "home-lab",
+    "manufacturer": "Ubiquiti",
+    "mac": "04:18:D6:5E:AF:65"
+  }
+]

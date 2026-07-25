@@ -298,6 +298,40 @@ class UserDatabase:
                 "permissions": ["read"]
             }
         }
+        # Persistence: the seeded accounts above are the baseline. Any users
+        # created/changed in-app are saved to USER_STORE_FILE and re-loaded here,
+        # so accounts and password changes SURVIVE a backend restart (previously
+        # the store was purely in-memory and reset every restart). Saved records
+        # override the seeded defaults for the same username.
+        self._store_file = os.getenv(
+            "USER_STORE_FILE",
+            os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "users.json"),
+        )
+        self._load_users()
+
+    def _load_users(self):
+        """Merge any persisted users over the seeded defaults."""
+        try:
+            with open(self._store_file, "r") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                # saved records win for matching usernames; seeded accounts remain
+                # as a fallback so the admin can always get in even if the file is
+                # partial or was hand-edited.
+                self.users.update(saved)
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            # No store yet (first run) or unreadable — keep seeded defaults and
+            # let the first mutation create the file.
+            pass
+
+    def _save_users(self):
+        """Persist the full user store to disk (best-effort, never fatal)."""
+        try:
+            os.makedirs(os.path.dirname(self._store_file), exist_ok=True)
+            with open(self._store_file, "w") as f:
+                json.dump(self.users, f, indent=2)
+        except OSError as e:
+            logger.error(f"Could not persist user store: {e}")
 
     def get_user(self, username: str) -> Optional[Dict]:
         """Retrieve a user by username."""
@@ -358,6 +392,7 @@ class UserDatabase:
         }
 
         self.users[username] = user
+        self._save_users()
         return user
 
     def list_users(self) -> list:
@@ -377,6 +412,7 @@ class UserDatabase:
         if self.users[username].get("role") == "admin" and len(admins) <= 1:
             raise ValueError("Cannot delete the last remaining admin account")
         del self.users[username]
+        self._save_users()
         return True
 
     def admin_set_password(self, username: str, new_password: str) -> bool:
@@ -387,6 +423,7 @@ class UserDatabase:
         if not new_password or len(new_password) < 6:
             raise ValueError("New password must be at least 6 characters")
         user["hashed_password"] = hash_password(new_password)
+        self._save_users()
         return True
 
     def change_password(self, username: str, old_password: str,
@@ -409,6 +446,7 @@ class UserDatabase:
             raise ValueError("New password must be at least 6 characters")
         # Update ONLY the credential. role/permissions are preserved.
         user["hashed_password"] = hash_password(new_password)
+        self._save_users()
         return True
 
 # Initialize the user database

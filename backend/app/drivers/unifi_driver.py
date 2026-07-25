@@ -38,7 +38,15 @@ class UniFiDriver(BaseNetworkDriver):
             mock_mode: If True, return mock data
         """
         super().__init__(device_config, mock_mode)
-        self.base_url = f"https://{device_config['host']}:{device_config.get('port', 8443)}"
+        # Protocol-aware base URL. Most UniFi controllers serve HTTPS (8443),
+        # but a locally-hosted Network app can serve plain HTTP (e.g. :8081).
+        # Resolution order: explicit device_config['scheme'] wins; otherwise
+        # infer http for the known HTTP UI ports (8080/8081), https elsewhere.
+        port = device_config.get('port', 8443)
+        scheme = device_config.get('scheme')
+        if not scheme:
+            scheme = "http" if str(port) in ("8080", "8081") else "https"
+        self.base_url = f"{scheme}://{device_config['host']}:{port}"
         self.site = device_config.get('site', 'default')
         self.device_mac = device_config.get('device_mac', '')
         self.session = None
@@ -74,8 +82,15 @@ class UniFiDriver(BaseNetworkDriver):
             if r.status_code == 200:
                 self.is_unifios = False
                 self.cookies = r.cookies
+                # This controller returns the CSRF token as a COOKIE named
+                # 'csrf_token' (not an X-CSRF-Token response header). Capture it
+                # so write calls (create/delete SSID) can echo it back; without
+                # it the controller rejects writes with 401 api.err.LoginRequired.
+                self.csrf_token = (self.session.cookies.get("csrf_token")
+                                   or r.headers.get("X-CSRF-Token")
+                                   or r.headers.get("x-csrf-token"))
                 self.logger.info(f"✅ Connected to UniFi Controller {self.device_config['host']} "
-                                 f"(legacy API, site={self.site})")
+                                 f"(legacy API, site={self.site}, csrf={'yes' if self.csrf_token else 'no'})")
                 return True
         except Exception as e:
             self.logger.info(f"Legacy login attempt failed ({e}); trying UniFi OS endpoint")
@@ -87,10 +102,12 @@ class UniFiDriver(BaseNetworkDriver):
             if r.status_code == 200:
                 self.is_unifios = True
                 self.csrf_token = (r.headers.get("X-CSRF-Token")
-                                   or r.headers.get("x-csrf-token"))
+                                   or r.headers.get("x-csrf-token")
+                                   or self.session.cookies.get("csrf_token")
+                                   or self.session.cookies.get("TOKEN"))
                 self.cookies = r.cookies
                 self.logger.info(f"✅ Connected to UniFi Controller {self.device_config['host']} "
-                                 f"(UniFi OS API, site={self.site})")
+                                 f"(UniFi OS API, site={self.site}, csrf={'yes' if self.csrf_token else 'no'})")
                 return True
             detail = ""
             try:
@@ -142,8 +159,16 @@ class UniFiDriver(BaseNetworkDriver):
         # UniFi OS controllers expose the Network app under /proxy/network.
         prefix = "/proxy/network" if self.is_unifios else ""
         url = f"{self.base_url}{prefix}{endpoint}"
+        # Echo the CSRF token on every write call. The controller hands this out
+        # as a 'csrf_token' cookie at login and rotates it on each response, so
+        # re-read the freshest value from the session cookie jar each time. This
+        # applies to BOTH legacy and UniFi-OS controllers — without it, writes
+        # (create/delete SSID) are rejected with 401 api.err.LoginRequired.
+        fresh_csrf = self.session.cookies.get("csrf_token") or self.csrf_token
+        if fresh_csrf:
+            self.csrf_token = fresh_csrf
         write_headers = {}
-        if self.is_unifios and self.csrf_token:
+        if self.csrf_token:
             write_headers["X-CSRF-Token"] = self.csrf_token
         
         try:
@@ -510,6 +535,35 @@ class UniFiDriver(BaseNetworkDriver):
             "result": result,
         }
 
+    def clear_wlans(self, keep_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Delete existing SSIDs except those named in keep_names.
+
+        Used by provision "replace mode" to reconfigure wireless from scratch.
+        A management SSID can be protected by listing its name in keep_names.
+        Because an SSID in UniFi is defined at the site/controller level and
+        applied to every AP in the group, this clears wireless across ALL APs at
+        once — matching the common admin workflow of pushing one wireless config
+        fleet-wide rather than per-device.
+        """
+        keep = set(n for n in (keep_names or []) if n)
+        removed, kept = [], []
+        if self.mock_mode:
+            return {"removed": [], "kept": list(keep)}
+        for wlan in self.get_wlan_groups():
+            name = wlan.get("name", "")
+            wid = wlan.get("id", "")
+            if not wid:
+                continue
+            if name in keep:
+                kept.append(name)
+                continue
+            try:
+                self.delete_wlan(wid)
+                removed.append(name)
+            except Exception as e:
+                self.logger.error(f"Failed to remove SSID '{name}': {e}")
+        return {"removed": removed, "kept": kept}
+
     def set_all_wlans_enabled(self, enabled: bool,
                               skip_keywords: Optional[List[str]] = None) -> Dict[str, Any]:
         """Enable/disable every SSID on the controller, with a safety skip-list.
@@ -638,8 +692,82 @@ class UniFiDriver(BaseNetworkDriver):
             self.logger.info(f"wlangroup lookup failed: {e}")
         return None
 
+    def _vlan_networkconf_id(self, vlan_id: int) -> Optional[str]:
+        """Find (or create) a VLAN-ONLY network profile for this VLAN and return
+        its _id, for attaching to a WLAN via networkconf_id.
+
+        WHY THIS EXISTS (verified against UniFi Network 10.4.57):
+        posting vlan_enabled/vlan directly on the wlanconf is SILENTLY IGNORED —
+        the controller accepts the SSID but shows it as "Native Network", so
+        client traffic goes out UNTAGGED and lands in the native VLAN. The
+        controller instead requires the WLAN to REFERENCE a network profile that
+        carries the VLAN. Creating that profile and attaching it via
+        networkconf_id is what actually tags the traffic.
+
+        The profile is VLAN-only (purpose="vlan-only"): no gateway/subnet/DHCP,
+        because the MikroTik provides the VLAN gateway and DHCP server. That
+        matches the "third-party gateway" topology the controller warns about.
+        Idempotent: an existing profile for the same VLAN is reused.
+        """
+        endpoint = f"/api/s/{self.site}/rest/networkconf"
+        try:
+            nets = self._api_request(endpoint) or []
+            for n in nets:
+                # match an existing vlan-only network on this VLAN id
+                try:
+                    if (str(n.get("vlan")) == str(vlan_id)
+                            and n.get("purpose") == "vlan-only"):
+                        self.logger.info(f"Reusing VLAN-only network for VLAN {vlan_id}")
+                        return n.get("_id")
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.info(f"networkconf lookup failed: {e}")
+
+        # Not found — create it.
+        payload = {
+            "name": f"UAF-VLAN-{vlan_id}",
+            "purpose": "vlan-only",
+            "vlan_enabled": True,
+            "vlan": str(vlan_id),
+            "enabled": True,
+        }
+        try:
+            created = self._api_request(endpoint, method="POST", data=payload)
+            if isinstance(created, list) and created:
+                new_id = created[0].get("_id")
+            elif isinstance(created, dict):
+                new_id = created.get("_id")
+            else:
+                new_id = None
+            if new_id:
+                self.logger.info(f"✅ Created VLAN-only network UAF-VLAN-{vlan_id}")
+            return new_id
+        except Exception as e:
+            self.logger.error(f"Could not create VLAN-only network for VLAN {vlan_id}: {e}")
+            return None
+
+    def delete_vlan_network(self, vlan_id: int) -> Dict[str, Any]:
+        """Remove the VLAN-only network profile created for a segment
+        (de-provision counterpart). Safe if it is already gone."""
+        if self.mock_mode:
+            return {"success": True, "vlan_id": vlan_id, "removed": False}
+        endpoint = f"/api/s/{self.site}/rest/networkconf"
+        try:
+            for n in (self._api_request(endpoint) or []):
+                if (str(n.get("vlan")) == str(vlan_id)
+                        and n.get("purpose") == "vlan-only"):
+                    nid = n.get("_id")
+                    self._api_request(f"{endpoint}/{nid}", method="DELETE")
+                    self.logger.info(f"Removed VLAN-only network for VLAN {vlan_id}")
+                    return {"success": True, "vlan_id": vlan_id, "removed": True}
+        except Exception as e:
+            self.logger.error(f"delete_vlan_network failed: {e}")
+        return {"success": True, "vlan_id": vlan_id, "removed": False}
+
     def create_guest_network(self, ssid: str, password: str, 
-                            guest_portal: bool = False) -> Dict[str, Any]:
+                            guest_portal: bool = False,
+                            vlan_id: Optional[int] = None) -> Dict[str, Any]:
         """
         Create a guest wireless network.
         
@@ -647,8 +775,16 @@ class UniFiDriver(BaseNetworkDriver):
             ssid: Network name
             password: WPA2 password
             guest_portal: Enable guest portal/hotspot
+            vlan_id: Optional 802.1Q VLAN to tag this WLAN's client traffic with.
+                     When set, the AP tags frames from clients of this SSID, so
+                     they land in that VLAN on the wired side (the AP's switch
+                     port must be a trunk carrying the VLAN). When None, traffic
+                     is untagged and lands in the port's native VLAN — which is
+                     why an untagged SSID's clients previously got management-
+                     subnet addresses.
         """
-        self.logger.info(f"Creating guest network '{ssid}'")
+        self.logger.info(f"Creating guest network '{ssid}'"
+                         + (f" (VLAN {vlan_id})" if vlan_id else ""))
         
         endpoint = f"/api/s/{self.site}/rest/wlanconf"
         # Minimal, broadly-compatible WLAN payload. We intentionally OMIT
@@ -664,6 +800,22 @@ class UniFiDriver(BaseNetworkDriver):
             "x_passphrase": password,
             "is_guest": bool(guest_portal),
         }
+        if vlan_id:
+            # Attach the WLAN to a VLAN-only NETWORK PROFILE. Posting
+            # vlan_enabled/vlan on the wlanconf is silently ignored by this
+            # controller (the SSID shows as "Native Network" and traffic goes
+            # out untagged) — referencing a networkconf is what actually tags it.
+            netconf_id = self._vlan_networkconf_id(vlan_id)
+            if netconf_id:
+                data["networkconf_id"] = netconf_id
+            else:
+                # Fall back to the legacy fields rather than silently creating an
+                # untagged SSID; log loudly so the failure is visible.
+                self.logger.error(
+                    f"Could not resolve/create VLAN-only network for VLAN {vlan_id}; "
+                    f"falling back to legacy vlan fields — SSID may end up UNTAGGED")
+                data["vlan_enabled"] = True
+                data["vlan"] = int(vlan_id)
         # Legacy controllers require a (populated) wlangroup_id on every SSID.
         # An empty string is rejected; omit it entirely if we cannot resolve one.
         wlangroup = self._default_wlangroup_id()
@@ -682,6 +834,7 @@ class UniFiDriver(BaseNetworkDriver):
             "ssid": ssid,
             "security": "WPA2",
             "guest_portal": guest_portal,
+            "vlan_id": vlan_id,
             "timestamp": datetime.now().isoformat()
         }
     

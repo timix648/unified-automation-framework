@@ -18,6 +18,7 @@ from app.inventory.netbox_client import NetboxInventory
 from app.core.nornir_manager import NornirManager
 from app.services.device_manager import DeviceFactory
 from app.services.kill_switch import KillSwitchService
+from app.services.oui_classifier import classify_mac
 from app.services.wol import send_magic_packet
 from app.services import schedule_policy
 from app.services import enforcement_state
@@ -74,8 +75,12 @@ def auto_enforce_time_policy():
                 driver.connect()
 
                 if not is_work_hours:
-                    # Deploy an extended ACL that blocks outbound HTTP/HTTPS
+                    # Deploy an extended ACL that blocks outbound HTTP/HTTPS.
+                    # Remove any existing copy FIRST so re-entering the named ACL
+                    # each cycle doesn't APPEND duplicate ACEs (IOS appends to an
+                    # existing named ACL rather than replacing it). Idempotent.
                     acl_commands = [
+                        "no ip access-list extended UAF-OFF-HOURS",
                         "ip access-list extended UAF-OFF-HOURS",
                         "remark Managed by UAF — restrict off-hours traffic",
                         "deny tcp any any eq 80",
@@ -107,15 +112,31 @@ def auto_enforce_time_policy():
                 driver.connect()
 
                 if not is_work_hours:
-                    # Add a forward-chain drop rule for HTTP/HTTPS
-                    driver.add_firewall_rule(
-                        chain="forward",
-                        action="drop",
-                        protocol="tcp",
-                        dst_port="80,443",
-                        comment=ACL_TAG,
-                    )
-                    logger.info(f"   -> {dev['name']}: Off-hours firewall rule added")
+                    # Add a forward-chain drop rule for HTTP/HTTPS — but only if
+                    # one tagged with ACL_TAG isn't already present. The scheduler
+                    # fires repeatedly during the off-hours window, so adding
+                    # unconditionally stacked duplicate rules every cycle (observed
+                    # 4+ identical UAF-OFF-HOURS-ACL rules). Idempotent: check first.
+                    already_present = False
+                    if not settings.MOCK_MODE:
+                        try:
+                            api = driver._get_api()
+                            fw = api.get_resource("/ip/firewall/filter")
+                            already_present = any(
+                                r.get("comment", "") == ACL_TAG for r in fw.get())
+                        except Exception as e:
+                            logger.error(f"   -> {dev['name']}: ACL existence check failed: {e}")
+                    if already_present:
+                        logger.info(f"   -> {dev['name']}: Off-hours rule already present — skipping (idempotent)")
+                    else:
+                        driver.add_firewall_rule(
+                            chain="forward",
+                            action="drop",
+                            protocol="tcp",
+                            dst_port="80,443",
+                            comment=ACL_TAG,
+                        )
+                        logger.info(f"   -> {dev['name']}: Off-hours firewall rule added")
 
                     # Disable WAN interface on edge routers
                     if is_edge:
@@ -254,27 +275,59 @@ def auto_scan_for_rogues():
                     port = rogue.get('interface')
                     if not mac or not port:
                         continue
-                    if armed:
-                        logger.critical(f"   ⚔️ KILL-SWITCH: Rogue {mac} found on {host}:{port}")
-                        # EXECUTE VIA SERVICE (Preserves Audit Log)
+
+                    # Classify the device by OUI. DESIGN: the kill-switch enforces
+                    # ONLY against unauthorized INFRASTRUCTURE (rogue switches/APs),
+                    # NOT end-user endpoints (laptops/phones). Isolating every new
+                    # laptop is unrealistic and not this project's threat model;
+                    # endpoint admission at scale is 802.1X/NAC (future work).
+                    # So OUI here does more than label — it GATES enforcement.
+                    cls = classify_mac(mac)
+                    dev_type = cls.get("device_type", "unknown")
+                    vendor = cls.get("vendor", "Unknown")
+                    threat_details = {
+                        "mac_address": mac,
+                        "oui_vendor": vendor,
+                        "device_type": dev_type,
+                        "oui_note": cls.get("note", ""),
+                    }
+
+                    # Enforce (shut port) only when ARMED *and* the unrecognized
+                    # device is infrastructure-type. Endpoints and unclassifiable
+                    # ("unknown") devices are recorded for admin review but never
+                    # auto-isolated — failing safe so a real user isn't knocked
+                    # offline on a guess.
+                    should_enforce = armed and dev_type == "infrastructure"
+
+                    if should_enforce:
+                        logger.critical(f"   ⚔️ KILL-SWITCH: Rogue INFRASTRUCTURE "
+                                        f"{mac} ({vendor}) on {host}:{port} — isolating")
                         ks_service.execute_response(
                             device_name=host,
                             port_id=port,
-                            threat_type="rogue_device_scheduled_scan",
-                            threat_details={"mac_address": mac}
+                            threat_type="rogue_infrastructure_scheduled_scan",
+                            threat_details=threat_details,
                         )
                     else:
-                        logger.info(f"   👁️  Reporting (learning mode): {mac} on "
-                                    f"{host}:{port} — not isolated")
+                        if armed and dev_type != "infrastructure":
+                            # Armed, but it's an endpoint/unknown — policy is to
+                            # NOT isolate end-user devices. Log + record only.
+                            logger.info(f"   👁️  Detected {dev_type} {mac} ({vendor}) "
+                                        f"on {host}:{port} — not infrastructure, "
+                                        f"not isolated (per kill-switch policy)")
+                        else:
+                            # Learning mode — report everything, isolate nothing.
+                            logger.info(f"   👁️  Reporting (learning mode): {mac} "
+                                        f"({vendor}, {dev_type}) on {host}:{port} "
+                                        f"— not isolated")
                         # Record the detection to the threat log (WITHOUT shutting
-                        # the port) so the device shows up on the Security page for
-                        # the admin to review and Trust. This is what makes the
-                        # learning-mode admission flow work end-to-end.
+                        # the port) so the device shows on the Security page for the
+                        # admin to review/Trust. Carries OUI vendor/type for the UI.
                         ks_service.record_detection(
                             device_name=host,
                             port_id=port,
                             threat_type="rogue_device_scheduled_scan",
-                            threat_details={"mac_address": mac},
+                            threat_details=threat_details,
                         )
         else:
             logger.info("   ✅ Scan Complete. Network is Clean.")

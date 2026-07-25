@@ -31,7 +31,7 @@ def send_magic_packet(mac_address: str, broadcast_ip: str = "255.255.255.255", p
         ValueError: If the MAC address format is invalid
     """
     # 1. Clean the MAC address (remove : or -)
-    mac_clean = mac_address.replace(":", "").replace("-", "").upper()
+    mac_clean = mac_address.replace(":", "").replace("-", "").replace(".", "").upper()
 
     if len(mac_clean) != 12 or not all(c in "0123456789ABCDEF" for c in mac_clean):
         raise ValueError(f"Invalid MAC address format: {mac_address}")

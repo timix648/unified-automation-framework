@@ -219,6 +219,115 @@ class MikroTikDriver(BaseNetworkDriver):
     # DHCP SERVER MANAGEMENT
     # =========================================================================
     
+    def create_vlan_segment(self, vlan_id: int, gateway_cidr: str,
+                            pool_name: str,
+                            uplink_interface: Optional[str] = None) -> Dict[str, Any]:
+        """Create the ROUTER side of a VLAN's data path: a VLAN sub-interface on
+        the uplink, the gateway IP on it, and a DHCP SERVER INSTANCE bound to it.
+
+        Why this exists: create_dhcp_pool() creates the pool and the
+        /ip/dhcp-server/network entry, but RouterOS only *serves* DHCP from a
+        server INSTANCE bound to an interface. Without this, provisioned
+        segments had scope definitions but no server actually answering on the
+        VLAN — clients fell through to the untagged path and got management-
+        subnet leases (the observed 192.168.1.199-on-a-provisioned-SSID issue).
+
+        Args:
+            vlan_id: 802.1Q VLAN id (e.g. 88)
+            gateway_cidr: gateway address WITH prefix, e.g. "192.168.88.1/24"
+            pool_name: base segment name; pool is "<pool_name>-pool" (matching
+                       create_dhcp_pool's naming)
+            uplink_interface: physical interface facing the switch trunk. If
+                None, derived as the interface holding the management IP (the
+                same derivation used by the clear-protection logic).
+        Idempotent: safe to re-run; existing objects are reused.
+        """
+        vlan_name = f"vlan{vlan_id}"
+        if self.mock_mode:
+            return {"success": True, "vlan_interface": vlan_name,
+                    "gateway": gateway_cidr, "dhcp_server": f"dhcp-{vlan_id}"}
+        try:
+            api = self._get_api()
+
+            # Resolve the uplink: the physical interface carrying management is,
+            # by definition, the one cabled to the switch — derive, don't hardcode.
+            if not uplink_interface:
+                mgmt_ip = self._mgmt_ip()
+                uplink_interface = None
+                try:
+                    for a in api.get_resource('/ip/address').get():
+                        addr = (a.get('address') or '').split('/')[0]
+                        if addr == mgmt_ip:
+                            uplink_interface = a.get('interface')
+                            break
+                except Exception as e:
+                    self.logger.error(f"uplink derivation failed: {e}")
+                if not uplink_interface:
+                    raise ValueError("Could not derive uplink interface for VLAN segment")
+
+            # 1. VLAN sub-interface (reuse if present)
+            vlan_res = api.get_resource('/interface/vlan')
+            existing = [v for v in vlan_res.get() if v.get('name') == vlan_name]
+            if existing:
+                self.logger.info(f"VLAN interface {vlan_name} exists — reusing")
+            else:
+                vlan_res.add(name=vlan_name, **{'vlan-id': str(vlan_id),
+                                                'interface': uplink_interface})
+
+            # 2. Gateway IP on the VLAN interface (reuse if present)
+            addr_res = api.get_resource('/ip/address')
+            if not any(a.get('address') == gateway_cidr and a.get('interface') == vlan_name
+                       for a in addr_res.get()):
+                addr_res.add(address=gateway_cidr, interface=vlan_name,
+                             comment=f"UAF VLAN {vlan_id} gateway")
+
+            # 3. DHCP SERVER INSTANCE bound to the VLAN interface, serving the
+            #    segment's pool (this is what actually answers DISCOVERs).
+            srv_res = api.get_resource('/ip/dhcp-server')
+            srv_name = f"dhcp-{vlan_id}"
+            if not any(s.get('name') == srv_name for s in srv_res.get()):
+                srv_res.add(name=srv_name, interface=vlan_name,
+                            **{'address-pool': f"{pool_name}-pool",
+                               'disabled': 'no'})
+
+            self.logger.info(f"✅ VLAN {vlan_id} segment live on {uplink_interface} "
+                             f"({vlan_name}, gw {gateway_cidr}, server {srv_name})")
+            return {"success": True, "vlan_interface": vlan_name,
+                    "uplink": uplink_interface, "gateway": gateway_cidr,
+                    "dhcp_server": srv_name,
+                    "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            self.logger.error(f"create_vlan_segment failed: {e}")
+            raise
+
+    def delete_vlan_segment(self, vlan_id: int) -> Dict[str, Any]:
+        """De-provision counterpart of create_vlan_segment: remove the DHCP
+        server instance, gateway address, and VLAN sub-interface for a segment.
+        Safe if any piece is already gone."""
+        vlan_name = f"vlan{vlan_id}"
+        removed = {"server": False, "address": False, "vlan": False}
+        if self.mock_mode:
+            return {"success": True, "removed": removed}
+        try:
+            api = self._get_api()
+            srv_res = api.get_resource('/ip/dhcp-server')
+            for s in srv_res.get():
+                if s.get('name') == f"dhcp-{vlan_id}":
+                    srv_res.remove(id=s['id']); removed["server"] = True
+            addr_res = api.get_resource('/ip/address')
+            for a in addr_res.get():
+                if a.get('interface') == vlan_name:
+                    addr_res.remove(id=a['id']); removed["address"] = True
+            vlan_res = api.get_resource('/interface/vlan')
+            for v in vlan_res.get():
+                if v.get('name') == vlan_name:
+                    vlan_res.remove(id=v['id']); removed["vlan"] = True
+            return {"success": True, "removed": removed,
+                    "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            self.logger.error(f"delete_vlan_segment failed: {e}")
+            raise
+
     def create_dhcp_pool(self, pool_name: str, network: str, 
                          gateway: str, dns_servers: List[str]) -> Dict[str, Any]:
         """
@@ -294,6 +403,196 @@ class MikroTikDriver(BaseNetworkDriver):
             self.logger.error(f"Failed to create DHCP pool: {str(e)}")
             raise
     
+    def delete_dhcp_network(self, pool_name: str, network: str) -> Dict[str, Any]:
+        """Remove the DHCP pool and DHCP-server network created by provisioning.
+
+        De-provision counterpart of create_dhcp_pool. Removes both the IP pool
+        (named "<pool_name>-pool") and the /ip/dhcp-server/network entry for the
+        given subnet. Safe to call if either is already gone.
+        """
+        self.logger.info(f"Removing DHCP pool '{pool_name}-pool' and network {network}")
+        if self.mock_mode:
+            return {"success": True, "pool_name": pool_name, "network": network,
+                    "action": "deleted"}
+        removed = {"pool": False, "network": False}
+        try:
+            api = self._get_api()
+
+            # Remove the DHCP-server network for this subnet
+            net_res = api.get_resource('/ip/dhcp-server/network')
+            for n in net_res.get():
+                if n.get("address") == network:
+                    net_res.remove(id=n["id"])
+                    removed["network"] = True
+
+            # Remove the IP pool created for this segment
+            pool_res = api.get_resource('/ip/pool')
+            for pl in pool_res.get():
+                if pl.get("name") == f"{pool_name}-pool":
+                    pool_res.remove(id=pl["id"])
+                    removed["pool"] = True
+
+            return {
+                "success": True,
+                "pool_name": pool_name,
+                "network": network,
+                "removed": removed,
+                "action": "deleted",
+                "timestamp": datetime.now().isoformat(),
+            }
+        except Exception as e:
+            self.logger.error(f"Failed to remove DHCP config: {e}")
+            raise
+
+    def _mgmt_ip(self) -> Optional[str]:
+        """The IP UAF is connected to this router on — the management lifeline
+        by definition. Used to derive what DHCP config must NEVER be cleared,
+        without hardcoding any subnet or pool/server NAME (which vary per site)."""
+        return self.device_config.get("host")
+
+    def _protected_dhcp(self, api) -> Dict[str, set]:
+        """Derive the management-critical DHCP config to protect during a clear,
+        from the router's OWN state + the management IP — no hardcoded names.
+
+        Protect:
+          1. Any dhcp-server NETWORK whose subnet contains the management IP
+             (the network the framework reaches the router through).
+          2. Any POOL referenced by a DHCP server that serves a protected network
+             (deleting a pool a live server depends on caused the 'unknown pool'
+             error-storm that destabilised the router). Protect by DEPENDENCY.
+          3. Any POOL whose ranges fall inside the management subnet.
+        Returns {"networks": set(addresses), "pools": set(names)}.
+        """
+        protected = {"networks": set(), "pools": set()}
+        mgmt_ip = self._mgmt_ip()
+        if not mgmt_ip:
+            # If we somehow don't know our own connect IP, protect nothing extra
+            # here — but the caller's keep-lists still apply. Better to under-clear.
+            self.logger.warning("clear: management IP unknown; relying on caller keep-lists only")
+            return protected
+        try:
+            mgmt_addr = ipaddress.ip_address(mgmt_ip)
+        except ValueError:
+            return protected
+
+        # 1. Networks whose subnet contains the management IP.
+        mgmt_networks = []  # (address_str, ip_network) for protected nets
+        try:
+            for n in api.get_resource('/ip/dhcp-server/network').get():
+                addr = n.get("address")
+                if not addr:
+                    continue
+                try:
+                    netobj = ipaddress.ip_network(addr, strict=False)
+                except ValueError:
+                    continue
+                if mgmt_addr in netobj:
+                    protected["networks"].add(addr)
+                    mgmt_networks.append(netobj)
+        except Exception as e:
+            self.logger.error(f"clear: could not read dhcp networks for protection: {e}")
+
+        # 2. Pools referenced by DHCP servers (protect by dependency). We can't
+        #    perfectly map server->network, so conservatively protect every pool
+        #    that ANY active dhcp-server uses — deleting an in-use pool is what
+        #    broke the router. This errs toward safety.
+        try:
+            for srv in api.get_resource('/ip/dhcp-server').get():
+                poolref = srv.get("address-pool")
+                if poolref and poolref not in ("static-only", "none"):
+                    protected["pools"].add(poolref)
+        except Exception as e:
+            self.logger.error(f"clear: could not read dhcp servers for protection: {e}")
+
+        # 3. Pools whose ranges fall inside a protected (management) subnet.
+        try:
+            for pl in api.get_resource('/ip/pool').get():
+                ranges = (pl.get("ranges") or "")
+                first_ip = ranges.split("-")[0].split(",")[0].strip()
+                if not first_ip:
+                    continue
+                try:
+                    ip = ipaddress.ip_address(first_ip)
+                except ValueError:
+                    continue
+                if any(ip in net for net in mgmt_networks):
+                    protected["pools"].add(pl.get("name"))
+        except Exception as e:
+            self.logger.error(f"clear: could not read pools for protection: {e}")
+
+        return protected
+
+    def clear_dhcp_pools(self, keep_names: Optional[List[str]] = None,
+                         keep_networks: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Remove operational DHCP pools and dhcp-server networks, while NEVER
+        removing the management-critical config — derived automatically from the
+        router's own state and the IP UAF connected on (no hardcoded names).
+
+        This is the 'replace mode' clear for the router. It honours the Replace
+        button's 'keep mgmt' guarantee: it wipes the operational DHCP config but
+        preserves the management path so the framework never severs its own
+        connection (and never leaves a DHCP server pointing at a deleted pool,
+        which previously destabilised the router with 'unknown pool' errors).
+
+        keep_names / keep_networks let the caller protect ADDITIONAL items; the
+        management config is protected automatically regardless.
+        """
+        removed = {"pools": [], "networks": [], "protected": {}}
+        if self.mock_mode:
+            return {"success": True, "removed": removed}
+        try:
+            api = self._get_api()
+
+            # Auto-derived management protection + caller-supplied extras.
+            auto = self._protected_dhcp(api)
+            keep_net = set(keep_networks or []) | auto["networks"]
+            keep_n = set(keep_names or []) | auto["pools"]
+            removed["protected"] = {"networks": sorted(keep_net), "pools": sorted(keep_n)}
+            self.logger.info(f"clear_dhcp_pools protecting networks={sorted(keep_net)} "
+                             f"pools={sorted(keep_n)} (mgmt IP={self._mgmt_ip()})")
+
+            # Remove non-protected dhcp-server networks.
+            net_res = api.get_resource('/ip/dhcp-server/network')
+            for n in net_res.get():
+                if n.get("address") in keep_net:
+                    continue
+                try:
+                    net_res.remove(id=n["id"])
+                    removed["networks"].append(n.get("address"))
+                except Exception as e:
+                    self.logger.error(f"Failed to remove network {n.get('address')}: {e}")
+
+            # Remove non-protected pools.
+            pool_res = api.get_resource('/ip/pool')
+            for pl in pool_res.get():
+                if pl.get("name") in keep_n:
+                    continue
+                try:
+                    pool_res.remove(id=pl["id"])
+                    removed["pools"].append(pl.get("name"))
+                except Exception as e:
+                    self.logger.error(f"Failed to remove pool {pl.get('name')}: {e}")
+
+            # Self-heal safety check: ensure no DHCP server is left pointing at a
+            # pool we just removed (the failure that caused the 'unknown pool'
+            # error-storm). If found, log loudly — do NOT leave it dangling.
+            try:
+                removed_pool_set = set(removed["pools"])
+                for srv in api.get_resource('/ip/dhcp-server').get():
+                    if srv.get("address-pool") in removed_pool_set:
+                        self.logger.error(
+                            f"SAFETY: DHCP server '{srv.get('name')}' references "
+                            f"removed pool '{srv.get('address-pool')}' — management "
+                            f"DHCP may be broken. Investigate immediately.")
+            except Exception as e:
+                self.logger.error(f"clear: post-clear safety check failed: {e}")
+
+            return {"success": True, "removed": removed,
+                    "timestamp": datetime.now().isoformat()}
+        except Exception as e:
+            self.logger.error(f"clear_dhcp_pools failed: {e}")
+            raise
+
     def get_dhcp_leases(self) -> List[Dict[str, Any]]:
         """Get active DHCP leases."""
         if self.mock_mode:

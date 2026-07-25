@@ -11,6 +11,7 @@ ADDITIONS:
 """
 
 import asyncio
+import os
 import socket
 from datetime import datetime
 
@@ -185,6 +186,17 @@ class WoLBatchRequest(BaseModel):
     broadcast_ip: Optional[str] = "255.255.255.255"
 
 
+class WoLSegmentRequest(BaseModel):
+    """Wake every host on a switch's network segment via a subnet-directed
+    broadcast. Selecting the switch sends a magic packet across its segment, so
+    all WoL-enabled hosts on that switch power on together."""
+    device_name: str = Field(..., description="The switch whose segment to wake")
+    broadcast_ip: Optional[str] = Field(
+        default=None,
+        description="Subnet broadcast, e.g. 192.168.1.255. Derived from the device "
+                    "IP if omitted.")
+
+
 class SecurityAlertRequest(BaseModel):
     device_name: str
     port_id: str
@@ -219,6 +231,21 @@ class NetworkProvisionRequest(BaseModel):
     enable_dhcp: bool = Field(default=True, description="Enable DHCP on the MikroTik router")
     enable_port_security: bool = Field(
         default=True, description="Enable port security on Cisco switch ports"
+    )
+    stitch_data_path: bool = Field(
+        default=True,
+        description=(
+            "Wire the segment END-TO-END: tag the WLAN with the VLAN, trunk the "
+            "AP + router uplink ports to carry it, and create the VLAN gateway "
+            "interface + a bound DHCP server instance on the router — so clients "
+            "of this segment actually receive addresses from ITS subnet instead "
+            "of falling through untagged to the management network."
+        ),
+    )
+    replace_existing: bool = Field(
+        default=False,
+        description="If true, clear existing non-management SSIDs before creating "
+                    "the new one (reconfigure-from-scratch for wireless)."
     )
     wifi_ssid: Optional[str] = Field(
         default=None, description="If provided, creates a WiFi SSID on UniFi AP"
@@ -555,6 +582,18 @@ async def get_active_threats(current_user: dict = Depends(get_current_user)):
                 "threat_type": t.get("threat_type", ""),
                 "timestamp": t.get("timestamp", ""),
                 "success": t.get("success", False),
+                # OUI classification (recorded by the kill-switch / scan). Surfaced
+                # so the Security page can show WHAT KIND of device was detected —
+                # infrastructure (a rogue switch/AP: the enforcement target) vs an
+                # endpoint. Defaults keep the keys always present for the UI.
+                "oui_vendor": details.get("oui_vendor", "Unknown"),
+                "device_type": details.get("device_type", "unknown"),
+                "oui_note": details.get("oui_note", ""),
+                # Distinguishes a learning-mode detection ("detected_only") from a
+                # real port shutdown, so the UI can label the row honestly instead
+                # of keying off `success` (which is True even for a detection that
+                # deliberately did NOT shut a port, mislabelling it QUARANTINED).
+                "action_taken": t.get("action_taken", ""),
             })
         return {"status": "success", "count": len(flattened), "threats": flattened}
     except Exception as e:
@@ -897,10 +936,92 @@ async def wake_devices_batch(request: WoLBatchRequest,
     return {"status": "success", "sent": sent, "total": len(request.macs), "results": results}
 
 
+def _subnet_broadcast(ip: str) -> str:
+    """Best-effort /24 subnet broadcast for an IPv4 address (x.y.z.255).
+    Falls back to the global broadcast if the IP cannot be parsed."""
+    try:
+        parts = ip.strip().split(".")
+        if len(parts) == 4 and all(o.isdigit() for o in parts):
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+    except Exception:
+        pass
+    return "255.255.255.255"
+
+
+@router.get("/power/discovered-hosts")
+async def discovered_hosts(current_user: dict = Depends(get_current_user)):
+    """List hosts seen on the network (from switch MAC address tables) as
+    Wake-on-LAN candidates. This surfaces real end-hosts — laptops, PCs — not
+    just the managed vendor devices, so any machine the network has seen can be
+    woken by its own MAC. Read-only."""
+    hosts = []
+    seen = set()
+    nb = NetboxInventory()
+    for device in nb.get_all_devices():
+        if "cisco" not in device.get("platform", "").lower():
+            continue
+        try:
+            drv = DeviceFactory.get_driver(device)
+            drv.connect()
+            for entry in drv.get_mac_address_table():
+                mac = (entry.get("mac_address") or "").strip()
+                if not mac or mac in seen:
+                    continue
+                seen.add(mac)
+                hosts.append({
+                    "mac": mac,
+                    "vlan": entry.get("vlan", ""),
+                    "interface": entry.get("interface", ""),
+                    "type": entry.get("type", ""),
+                    "via": device["name"],
+                })
+            drv.disconnect()
+        except Exception as e:
+            audit_logger.log_security_event(
+                "WOL_DISCOVERY_ERROR", f"{device.get('name')}: {e}")
+    return {"status": "success", "count": len(hosts), "hosts": hosts}
+
+
+@router.post("/power/wake-segment")
+async def wake_segment(request: WoLSegmentRequest,
+                       current_user: dict = Depends(require_operator)):
+    """Wake every WoL-enabled host on a switch's segment via subnet broadcast.
+    Selecting the switch floods a magic packet across its network so all hosts
+    on that segment power on together."""
+    nb = NetboxInventory()
+    device = next((d for d in nb.get_all_devices()
+                   if d.get("name") == request.device_name), None)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    broadcast = request.broadcast_ip or _subnet_broadcast(
+        device.get("primary_ip") or device.get("ip", ""))
+    # A segment wake floods the broadcast with a packet whose payload MAC is the
+    # broadcast MAC; every WoL NIC on the segment receives the frame.
+    try:
+        send_magic_packet("FF:FF:FF:FF:FF:FF", broadcast)
+        audit_logger.log_security_event(
+            "WOL_SEGMENT_SENT",
+            f"Segment wake broadcast to {broadcast} via {request.device_name}")
+        return {"status": "success",
+                "message": f"Segment wake sent across {broadcast}",
+                "broadcast_ip": broadcast, "device": request.device_name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============================================================================
 # NETWORK PROVISIONING ENDPOINT
 # (The "smart setup" — user describes a network, system configures all devices)
 # ============================================================================
+
+
+class DeprovisionRequest(BaseModel):
+    """De-provision (remove) a network segment across all vendors."""
+    network_name: str = Field(..., description="Name used when the VLAN/SSID was created")
+    vlan_id: int = Field(..., ge=2, le=4094, description="VLAN ID to remove")
+    subnet: str = Field(..., description="Subnet of the DHCP network to remove, e.g. 192.168.77.0/24")
+    switch_ports: List[str] = Field(default=[], description="Cisco ports to clear back to default VLAN")
+    ssid: Optional[str] = Field(default=None, description="UniFi SSID name to remove (optional)")
 
 
 @router.post("/provision/network")
@@ -935,6 +1056,17 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
         try:
             driver = DeviceFactory.get_driver(device)
             driver.connect()
+
+            # Replace mode: clear existing operational VLANs first, but keep the
+            # VLAN UAF is being asked to create AND the management VLAN (default 1
+            # and reserved IDs are always protected inside clear_vlans).
+            if request.replace_existing:
+                cleared = driver.clear_vlans(keep_vlans=[request.vlan_id])
+                results["steps_completed"].append({
+                    "step": "clear_existing_vlans",
+                    "device": device["name"],
+                    "result": cleared
+                })
 
             # Create VLAN
             vlan_result = driver.create_vlan(request.vlan_id, request.network_name)
@@ -997,7 +1129,36 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
         for device in mikrotik_devices:
             try:
                 driver = DeviceFactory.get_driver(device)
-                driver.connect()
+                # Retry the connect: if a previous provision left the router's
+                # uplink mid-STP-reconvergence, the first attempt can time out
+                # even though the router is healthy seconds later. Three tries
+                # with a short backoff makes the step robust instead of flaky.
+                _last_err = None
+                for _attempt in range(3):
+                    try:
+                        driver.connect()
+                        _last_err = None
+                        break
+                    except Exception as ce:
+                        _last_err = ce
+                        if _attempt < 2:
+                            await asyncio.sleep(8)
+                if _last_err is not None:
+                    raise _last_err
+
+                # Replace mode: clear existing DHCP pools/networks first, but keep
+                # the pool being created and the management subnet so UAF never
+                # severs its own connection to the router.
+                if request.replace_existing:
+                    cleared = driver.clear_dhcp_pools(
+                        keep_names=[f"{request.network_name}-pool"],
+                        keep_networks=[request.subnet],
+                    )
+                    results["steps_completed"].append({
+                        "step": "clear_existing_dhcp",
+                        "device": device["name"],
+                        "result": cleared
+                    })
 
                 dhcp_result = driver.create_dhcp_pool(
                     pool_name=request.network_name,
@@ -1010,6 +1171,32 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                     "device": device["name"],
                     "result": dhcp_result
                 })
+
+                # Data-path stitching (router side): a pool + network entry alone
+                # doesn't SERVE anything — RouterOS answers DHCP only from a
+                # server instance bound to an interface. Create the VLAN
+                # sub-interface on the uplink, put the gateway IP on it, and
+                # bind a DHCP server to it so clients of this VLAN get leases
+                # from THIS subnet (not the management defconf server).
+                if request.stitch_data_path:
+                    try:
+                        prefix = request.subnet.split("/")[1]
+                        seg_result = driver.create_vlan_segment(
+                            vlan_id=request.vlan_id,
+                            gateway_cidr=f"{request.gateway}/{prefix}",
+                            pool_name=request.network_name,
+                        )
+                        results["steps_completed"].append({
+                            "step": "create_vlan_gateway",
+                            "device": device["name"],
+                            "result": seg_result
+                        })
+                    except Exception as e:
+                        results["steps_failed"].append({
+                            "step": "create_vlan_gateway",
+                            "device": device["name"],
+                            "error": str(e)
+                        })
 
                 driver.disconnect()
 
@@ -1029,10 +1216,24 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                 driver = DeviceFactory.get_driver(device)
                 driver.connect()
 
+                # Replace mode: clear existing SSIDs (except the management one)
+                # so the AP/controller ends with only the new wireless config.
+                if request.replace_existing:
+                    cleared = driver.clear_wlans(keep_names=[request.wifi_ssid])
+                    results["steps_completed"].append({
+                        "step": "clear_existing_ssids",
+                        "device": device["name"],
+                        "result": cleared
+                    })
+
                 wifi_result = driver.create_guest_network(
                     ssid=request.wifi_ssid,
                     password=request.wifi_password,
-                    guest_portal=False
+                    guest_portal=False,
+                    # Tag client traffic with the segment's VLAN so it lands in
+                    # that VLAN on the wire (instead of untagged -> native VLAN
+                    # -> management DHCP, the observed 192.168.1.x-lease issue).
+                    vlan_id=request.vlan_id if request.stitch_data_path else None,
                 )
                 results["steps_completed"].append({
                     "step": "create_wifi_ssid",
@@ -1045,6 +1246,82 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
             except Exception as e:
                 results["steps_failed"].append({
                     "step": "create_wifi_ssid",
+                    "device": device["name"],
+                    "error": str(e)
+                })
+
+    # ---- Step 4 (LAST): trunk the AP + router uplinks to carry the VLAN ----
+    # ORDERING IS DELIBERATE. Converting a port to trunk mode briefly bounces
+    # the link (STP reconvergence, ~15-30s on this switch). The router hangs off
+    # one of those very ports, so doing this BEFORE the MikroTik step made the
+    # router unreachable exactly when UAF needed it ("MikroTik connection failed:
+    # timed out"). All per-device configuration is therefore complete before we
+    # touch the uplinks. Native VLAN 1 is preserved inside
+    # configure_uplink_trunk, so untagged management traffic still flows once
+    # the link settles.
+    if request.stitch_data_path:
+        for device in [d for d in devices if "cisco" in d.get("platform", "").lower()]:
+            try:
+                driver = DeviceFactory.get_driver(device)
+                driver.connect()
+
+                # DISCOVER the uplinks rather than trusting hardcoded ports.
+                # For each non-Cisco managed device, look its MAC up in the
+                # switch's MAC table to learn which port it hangs off. Hardcoded
+                # uplinks break silently on re-cabling (a router moved to Fa0/15
+                # while UAF trunked an empty Fa0/24). Env vars remain as a
+                # fallback for devices whose MAC isn't known/learned yet.
+                uplinks = {}
+                for peer in devices:
+                    plat = (peer.get("platform") or "").lower()
+                    if "cisco" in plat:
+                        continue
+                    role = ("router_uplink" if ("mikrotik" in plat or "routeros" in plat)
+                            else "ap_uplink" if ("unifi" in plat or "ubiquiti" in plat)
+                            else f"{peer.get('name', 'peer')}_uplink")
+                    peer_mac = (peer.get("mac_address") or peer.get("mac")
+                                or (peer.get("credentials", {}) or {}).get("mac"))
+                    found = None
+                    if peer_mac:
+                        try:
+                            found = driver.find_port_for_mac(peer_mac)
+                        except Exception as e:
+                            results["steps_failed"].append({
+                                "step": f"discover_{role}",
+                                "device": device["name"],
+                                "error": str(e)
+                            })
+                    if found:
+                        uplinks[role] = found
+                        results["steps_completed"].append({
+                            "step": f"discover_{role}",
+                            "device": device["name"],
+                            "result": {"mac": peer_mac, "port": found, "source": "mac-table"}
+                        })
+                # Fall back to configured defaults for anything not discovered.
+                uplinks.setdefault("ap_uplink", os.getenv("AP_UPLINK_PORT", "Fa0/23"))
+                uplinks.setdefault("router_uplink", os.getenv("ROUTER_UPLINK_PORT", "Fa0/24"))
+
+                for role, up_port in uplinks.items():
+                    try:
+                        trunk_res = driver.configure_uplink_trunk(up_port, request.vlan_id)
+                        results["steps_completed"].append({
+                            "step": f"trunk_{role}",
+                            "device": device["name"],
+                            "port": up_port,
+                            "result": trunk_res
+                        })
+                    except Exception as e:
+                        results["steps_failed"].append({
+                            "step": f"trunk_{role}",
+                            "device": device["name"],
+                            "port": up_port,
+                            "error": str(e)
+                        })
+                driver.disconnect()
+            except Exception as e:
+                results["steps_failed"].append({
+                    "step": "trunk_uplinks",
                     "device": device["name"],
                     "error": str(e)
                 })
@@ -1220,3 +1497,155 @@ async def reset_user_password(username: str, request: ResetPasswordRequest,
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# DE-PROVISION (remove a network segment across all vendors)
+# The reverse of /provision/network: removes the VLAN + port assignments on
+# Cisco, the DHCP pool + network on MikroTik, and the SSID on UniFi — from one
+# action. Removal is BY IDENTIFIER (name/VLAN/subnet/SSID) the admin supplies;
+# UAF never guesses what to destroy from discovered state.
+# ============================================================================
+
+
+@router.get("/provision/segments")
+async def list_segments(current_user: dict = Depends(get_current_user)):
+    """Read current network segments from the live devices so the admin can see
+    what exists before choosing one to remove. Reads VLANs (Cisco), DHCP leases/
+    pools (MikroTik) and WLANs (UniFi). Read-only — never modifies anything."""
+    out = {"cisco_vlans": [], "unifi_ssids": [], "errors": []}
+    nb = NetboxInventory()
+    devices = nb.get_all_devices()
+    for device in devices:
+        platform = device.get("platform", "").lower()
+        try:
+            if "cisco" in platform:
+                drv = DeviceFactory.get_driver(device)
+                drv.connect()
+                for v in drv.get_vlans():
+                    out["cisco_vlans"].append({"device": device["name"], **v})
+                drv.disconnect()
+            elif "unifi" in platform or "ubiquiti" in platform:
+                drv = DeviceFactory.get_driver(device)
+                drv.connect()
+                for w in drv.get_wlan_groups():
+                    out["unifi_ssids"].append({"device": device["name"],
+                                               "name": w.get("name", ""),
+                                               "id": w.get("id", w.get("_id", ""))})
+                drv.disconnect()
+        except Exception as e:
+            out["errors"].append({"device": device.get("name"), "error": str(e)})
+    return {"status": "success", "segments": out}
+
+
+@router.post("/provision/deprovision")
+async def deprovision_network(request: DeprovisionRequest,
+                              current_user: dict = Depends(require_admin)):
+    """Remove a network segment across Cisco + MikroTik + UniFi in one action."""
+    results = {
+        "network_name": request.network_name,
+        "vlan_id": request.vlan_id,
+        "subnet": request.subnet,
+        "steps_completed": [],
+        "steps_failed": [],
+    }
+    nb = NetboxInventory()
+    devices = nb.get_all_devices()
+
+    # ---- Cisco: delete VLAN + clear ports ----
+    for device in [d for d in devices if "cisco" in d.get("platform", "").lower()]:
+        try:
+            drv = DeviceFactory.get_driver(device)
+            drv.connect()
+            res = drv.delete_vlan(request.vlan_id, request.switch_ports)
+            results["steps_completed"].append(
+                {"step": "delete_vlan", "device": device["name"], "result": res})
+            # Reverse of data-path stitching: drop this VLAN from the AP/router
+            # uplink trunks (the trunks themselves and all other VLANs remain).
+            for role, up_port in {
+                "ap_uplink": os.getenv("AP_UPLINK_PORT", "Fa0/23"),
+                "router_uplink": os.getenv("ROUTER_UPLINK_PORT", "Fa0/24"),
+            }.items():
+                try:
+                    tres = drv.remove_vlan_from_trunk(up_port, request.vlan_id)
+                    results["steps_completed"].append(
+                        {"step": f"untrunk_{role}", "device": device["name"],
+                         "port": up_port, "result": tres})
+                except Exception as e:
+                    results["steps_failed"].append(
+                        {"step": f"untrunk_{role}", "device": device["name"],
+                         "port": up_port, "error": str(e)})
+            drv.disconnect()
+        except Exception as e:
+            results["steps_failed"].append(
+                {"step": "delete_vlan", "device": device["name"], "error": str(e)})
+
+    # ---- MikroTik: delete DHCP pool + network ----
+    for device in [d for d in devices if "mikrotik" in d.get("platform", "").lower()
+                   or "routeros" in d.get("platform", "").lower()]:
+        try:
+            drv = DeviceFactory.get_driver(device)
+            drv.connect()
+            res = drv.delete_dhcp_network(request.network_name, request.subnet)
+            results["steps_completed"].append(
+                {"step": "delete_dhcp_network", "device": device["name"], "result": res})
+            # Reverse of data-path stitching: remove the segment's DHCP server
+            # instance, gateway address, and VLAN sub-interface. Safe no-op if
+            # the segment was provisioned without stitching.
+            try:
+                sres = drv.delete_vlan_segment(request.vlan_id)
+                results["steps_completed"].append(
+                    {"step": "delete_vlan_gateway", "device": device["name"], "result": sres})
+            except Exception as e:
+                results["steps_failed"].append(
+                    {"step": "delete_vlan_gateway", "device": device["name"], "error": str(e)})
+            drv.disconnect()
+        except Exception as e:
+            results["steps_failed"].append(
+                {"step": "delete_dhcp_network", "device": device["name"], "error": str(e)})
+
+    # ---- UniFi: delete SSID (if named) ----
+    if request.ssid:
+        for device in [d for d in devices if "unifi" in d.get("platform", "").lower()
+                       or "ubiquiti" in d.get("platform", "").lower()]:
+            try:
+                drv = DeviceFactory.get_driver(device)
+                drv.connect()
+                # Resolve the SSID name to its WLAN id, then delete.
+                target = next((w for w in drv.get_wlan_groups()
+                               if w.get("name") == request.ssid), None)
+                if target:
+                    wid = target.get("id") or target.get("_id")
+                    res = drv.delete_wlan(wid)
+                    results["steps_completed"].append(
+                        {"step": "delete_wifi_ssid", "device": device["name"], "result": res})
+                    # Also remove the VLAN-only network profile created for this
+                    # segment, so repeated provision/deprovision cycles don't
+                    # leave orphaned UAF-VLAN-<id> networks in the controller.
+                    try:
+                        nres = drv.delete_vlan_network(request.vlan_id)
+                        results["steps_completed"].append(
+                            {"step": "delete_vlan_network", "device": device["name"],
+                             "result": nres})
+                    except Exception as e:
+                        results["steps_failed"].append(
+                            {"step": "delete_vlan_network", "device": device["name"],
+                             "error": str(e)})
+                else:
+                    results["steps_failed"].append(
+                        {"step": "delete_wifi_ssid", "device": device["name"],
+                         "error": f"SSID '{request.ssid}' not found"})
+                drv.disconnect()
+            except Exception as e:
+                results["steps_failed"].append(
+                    {"step": "delete_wifi_ssid", "device": device["name"], "error": str(e)})
+
+    ok = len(results["steps_completed"])
+    fail = len(results["steps_failed"])
+    audit_logger.log_security_event(
+        "NETWORK_DEPROVISIONED",
+        f"Segment '{request.network_name}' (VLAN {request.vlan_id}) removed: "
+        f"{ok} steps OK, {fail} steps failed")
+    event_bus.publish("deprovision", summary=f"Removed {request.network_name} "
+                      f"({ok} ok, {fail} failed)")
+    return {"status": "success", "details": results}

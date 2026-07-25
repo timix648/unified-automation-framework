@@ -18,6 +18,7 @@ from pathlib import Path
 from app.inventory.netbox_client import NetboxInventory
 from app.services.device_manager import DeviceFactory
 from app.core.config import settings
+from app.services.oui_classifier import classify_mac
 
 # Per-device SSH locks. Operations to the SAME device are serialized (a slow
 # legacy switch refuses simultaneous SSH sessions), while operations to
@@ -203,6 +204,17 @@ class KillSwitchService:
                 return inc  # already recorded — no duplicate
 
         incident_id = f"DET-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+        # OUI classification: tag the detected device with its likely vendor and
+        # type (infrastructure vs endpoint) from the MAC's OUI. Labelling only —
+        # this does NOT auto-trust, auto-shut, or change severity. It helps the
+        # admin tell a rogue switch/AP from a user's laptop in the Security page.
+        oui_info = classify_mac(mac)
+        details = dict(threat_details or {})
+        details["oui_vendor"] = oui_info["vendor"]
+        details["device_type"] = oui_info["device_type"]
+        details["oui_note"] = oui_info["note"]
+
         incident = {
             "incident_id": incident_id,
             "timestamp": datetime.now().isoformat(),
@@ -210,7 +222,9 @@ class KillSwitchService:
             "device_ip": device_ip,
             "port_id": port_id,
             "threat_type": threat_type,
-            "threat_details": threat_details or {},
+            "threat_details": details,
+            "oui_vendor": oui_info["vendor"],
+            "device_type": oui_info["device_type"],
             "action_taken": "detected_only",   # learning mode — nothing shut
             "action_result": {"success": True, "message": "Detected (learning mode — not isolated)"},
             "success": True,
@@ -244,7 +258,15 @@ class KillSwitchService:
         
         # Generate unique incident ID
         incident_id = f"INC-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        
+
+        # OUI classification (labelling only — see record_detection).
+        _mac = (threat_details or {}).get("mac_address", "")
+        oui_info = classify_mac(_mac)
+        details = dict(threat_details or {})
+        details["oui_vendor"] = oui_info["vendor"]
+        details["device_type"] = oui_info["device_type"]
+        details["oui_note"] = oui_info["note"]
+
         incident = {
             "incident_id": incident_id,
             "timestamp": datetime.now().isoformat(),
@@ -252,7 +274,9 @@ class KillSwitchService:
             "device_ip": device_ip,
             "port_id": port_id,
             "threat_type": threat_type,
-            "threat_details": threat_details or {},
+            "threat_details": details,
+            "oui_vendor": oui_info["vendor"],
+            "device_type": oui_info["device_type"],
             "action_taken": "port_shutdown" if success else "attempted_shutdown",
             "action_result": action_result,
             "success": success
@@ -264,9 +288,33 @@ class KillSwitchService:
                 log = json.load(f)
         except (json.JSONDecodeError, FileNotFoundError):
             log = []
-        
-        # Append new incident
-        log.append(incident)
+
+        # De-duplicate: the scan runs repeatedly, so the SAME device re-detected
+        # on the same port must UPDATE its existing incident rather than append a
+        # new identical row every cycle (which previously stacked duplicates in
+        # the Security page). Key on device + port + MAC.
+        _key_mac = (details.get("mac_address") or "").upper()
+        existing_idx = None
+        for i, rec in enumerate(log):
+            rd = rec.get("threat_details") or {}
+            if (rec.get("device_name") == device_name
+                    and rec.get("port_id") == port_id
+                    and (rd.get("mac_address") or "").upper() == _key_mac):
+                existing_idx = i
+                break
+
+        if existing_idx is not None:
+            # Preserve the original incident_id/first-seen timestamp; refresh the
+            # rest so the row reflects the latest scan and action outcome.
+            prior = log[existing_idx]
+            incident["incident_id"] = prior.get("incident_id", incident_id)
+            incident["first_seen"] = prior.get("first_seen", prior.get("timestamp"))
+            incident["detections"] = prior.get("detections", 1) + 1
+            log[existing_idx] = incident
+        else:
+            incident["first_seen"] = incident["timestamp"]
+            incident["detections"] = 1
+            log.append(incident)
         
         # Write back to file
         with open(self.threat_log_file, 'w') as f:

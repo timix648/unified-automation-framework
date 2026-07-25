@@ -55,3 +55,21 @@ logs/
 postgres-data/
 redis-data/
 netbox-*/
+
+# Backups from file swaps
+*.bak
+*.bak2
+*.bak3
+*.bak4
+*.bak5
+*.old
+
+# Archives
+*.tar.gz
+*.zip
+
+# Persisted user store (bcrypt hashes — still credentials)
+backend/app/data/
+
+cookies.txt
+backend/authorized_devices.json

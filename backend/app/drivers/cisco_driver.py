@@ -349,6 +349,34 @@ class CiscoIOSDriver(BaseNetworkDriver):
             "timestamp": datetime.now().isoformat()
         }
     
+    def delete_vlan(self, vlan_id: int, ports: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Remove a VLAN and (optionally) clear it from the given access ports.
+
+        De-provision counterpart of create_vlan/assign_vlan_to_port. If ports are
+        supplied, each port is returned to the default VLAN before the VLAN itself
+        is deleted, so no interface is left orphaned on a non-existent VLAN.
+        """
+        self.logger.info(f"Deleting VLAN {vlan_id} (clearing ports: {ports})")
+        commands = []
+        for port in (ports or []):
+            port = port.strip()
+            if not port:
+                continue
+            commands += [
+                f"interface {port}",
+                "no switchport access vlan",
+                "exit",
+            ]
+        commands.append(f"no vlan {vlan_id}")
+        output = self._execute_config_commands(commands)
+        return {
+            "success": True,
+            "vlan_id": vlan_id,
+            "ports_cleared": ports or [],
+            "action": "deleted",
+            "timestamp": datetime.now().isoformat(),
+        }
+
     def assign_vlan_to_port(self, port_id: str, vlan_id: int, mode: str = "access") -> Dict[str, Any]:
         """
         Assign a VLAN to an interface.
@@ -387,6 +415,58 @@ class CiscoIOSDriver(BaseNetworkDriver):
             "timestamp": datetime.now().isoformat()
         }
     
+    def configure_uplink_trunk(self, port_id: str, vlan_id: int,
+                               native_vlan: int = 1) -> Dict[str, Any]:
+        """Make an uplink/infrastructure port a trunk CARRYING an extra VLAN,
+        without disturbing existing traffic.
+
+        Safety-critical details (why this exists instead of using
+        assign_vlan_to_port(mode="trunk")):
+        - Uses 'switchport trunk allowed vlan add <id>' — the plain
+          'allowed vlan <id>' form REPLACES the whole allowed list with only
+          that VLAN, which would strip VLAN 1 off the uplink and cut
+          management to the AP / router behind it.
+        - Pins 'switchport trunk native vlan <native_vlan>' (default 1) so all
+          existing UNTAGGED traffic (AP management, router management) keeps
+          flowing exactly as before the port became a trunk.
+        Idempotent: re-running for the same VLAN just re-adds it (IOS treats
+        duplicate 'add' as a no-op).
+        """
+        self.logger.info(f"Trunking {port_id}: add VLAN {vlan_id}, native {native_vlan}")
+        if self.mock_mode:
+            return {"success": True, "port": port_id, "vlan_added": vlan_id,
+                    "native_vlan": native_vlan, "mode": "trunk"}
+        commands = [
+            f"interface {port_id}",
+            "switchport mode trunk",
+            f"switchport trunk native vlan {native_vlan}",
+            f"switchport trunk allowed vlan add {vlan_id}",
+            "no shutdown",
+        ]
+        output = self._execute_config_commands(commands)
+        return {
+            "success": True,
+            "port": port_id,
+            "vlan_added": vlan_id,
+            "native_vlan": native_vlan,
+            "mode": "trunk",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def remove_vlan_from_trunk(self, port_id: str, vlan_id: int) -> Dict[str, Any]:
+        """De-provision counterpart: remove one VLAN from a trunk's allowed list
+        (leaves the port a trunk and all other VLANs untouched)."""
+        self.logger.info(f"Removing VLAN {vlan_id} from trunk {port_id}")
+        if self.mock_mode:
+            return {"success": True, "port": port_id, "vlan_removed": vlan_id}
+        commands = [
+            f"interface {port_id}",
+            f"switchport trunk allowed vlan remove {vlan_id}",
+        ]
+        self._execute_config_commands(commands)
+        return {"success": True, "port": port_id, "vlan_removed": vlan_id,
+                "timestamp": datetime.now().isoformat()}
+
     def get_vlans(self) -> List[Dict[str, Any]]:
         """Get all VLANs configured on the device."""
         output = self._execute_command("show vlan brief")
@@ -394,6 +474,33 @@ class CiscoIOSDriver(BaseNetworkDriver):
         
         return vlans
     
+    def clear_vlans(self, keep_vlans: Optional[List[int]] = None) -> Dict[str, Any]:
+        """Delete all user VLANs except protected ones.
+
+        Protected by default: VLAN 1 (default), the Cisco-reserved 1002-1005, and
+        any VLAN IDs passed in keep_vlans (e.g. the management VLAN UAF connects
+        through — never removed, so the management path is preserved). This is the
+        "replace mode" clear: it wipes operational VLANs but keeps the lifeline.
+        """
+        protected = {1, 1002, 1003, 1004, 1005}
+        protected.update(int(v) for v in (keep_vlans or []))
+        removed = []
+        for v in self.get_vlans():
+            try:
+                vid = int(v.get("vlan_id"))
+            except (TypeError, ValueError):
+                continue
+            if vid in protected:
+                continue
+            try:
+                self._execute_config_commands([f"no vlan {vid}"])
+                removed.append(vid)
+            except Exception as e:
+                self.logger.error(f"Failed to remove VLAN {vid}: {e}")
+        return {"success": True, "removed_vlans": removed,
+                "protected": sorted(protected),
+                "timestamp": datetime.now().isoformat()}
+
     def _parse_vlan_brief(self, output: str) -> List[Dict[str, Any]]:
         """Parse 'show vlan brief' output."""
         vlans = []
@@ -427,6 +534,40 @@ class CiscoIOSDriver(BaseNetworkDriver):
     # MAC ADDRESS TABLE
     # =========================================================================
     
+    def find_port_for_mac(self, mac_address: str) -> Optional[str]:
+        """Discover WHICH switch port a given device's MAC is learned on.
+
+        Replaces hardcoded uplink ports. UAF knows each managed device's MAC
+        (from NetBox / the inventory), and the switch already knows which port
+        it is reachable through — so the uplink can be DERIVED instead of
+        configured. This is what makes stitching survive re-cabling: when the
+        router was moved from Fa0/24 to Fa0/15, a hardcoded uplink silently
+        trunked the wrong (empty) port while the device sat elsewhere.
+
+        Accepts any MAC format (aa:bb:cc:dd:ee:ff, aabb.ccdd.eeff, bare hex)
+        and normalises before comparing, since IOS reports dotted-quad.
+        Returns the interface name (e.g. "Fa0/24") or None if not learned.
+        """
+        def _norm(m: str) -> str:
+            return re.sub(r'[^0-9a-f]', '', (m or '').lower())
+
+        target = _norm(mac_address)
+        if len(target) != 12:
+            self.logger.error(f"find_port_for_mac: invalid MAC {mac_address!r}")
+            return None
+        if self.mock_mode:
+            return "Fa0/24"
+        try:
+            for entry in self.get_mac_address_table():
+                if _norm(entry.get("mac_address", "")) == target:
+                    port = entry.get("interface")
+                    self.logger.info(f"Discovered {mac_address} on port {port}")
+                    return port
+        except Exception as e:
+            self.logger.error(f"find_port_for_mac failed: {e}")
+        self.logger.info(f"MAC {mac_address} not found in switch MAC table")
+        return None
+
     def get_mac_address_table(self, vlan_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Get MAC address table.

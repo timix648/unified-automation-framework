@@ -170,7 +170,9 @@ class CiscoIOSDriver(BaseNetworkDriver):
             if enable_mode and not self.connection.check_enable_mode():
                 self.connection.enable()
                 
-            output = self.connection.send_command(command, delay_factor=2, read_timeout=45)
+            output = self.connection.send_command(
+                command, delay_factor=2,
+                read_timeout=int(os.getenv('CISCO_READ_TIMEOUT', '60')))
             print(f"🔎 RAW send_command({command!r}) ->\n{output[:400]}\n--- end raw ---")
             return output
             
@@ -206,7 +208,13 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # waiting to echo each command back (another slow-switch stall).
             output = self.connection.send_config_set(
                 commands,
-                read_timeout=60,
+                # Env-tunable: on a LAN 60s is ample, but when the switch is
+                # reached across a WAN/VPN every prompt round-trip costs the
+                # link RTT (~340ms measured Lagos->Azure), so a multi-command
+                # config set can exceed it and fail with 'Pattern not detected'
+                # even though the commands applied. Raise CISCO_READ_TIMEOUT
+                # for remote deployments rather than editing code.
+                read_timeout=int(os.getenv('CISCO_READ_TIMEOUT', '60')),
                 delay_factor=2,
                 cmd_verify=False,
             )

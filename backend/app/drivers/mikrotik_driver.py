@@ -13,6 +13,64 @@ import ipaddress
 from .base_driver import BaseNetworkDriver
 
 
+def _patch_routeros_login() -> None:
+    """Fix a routeros_api bug that breaks login against pre-6.43 RouterOS.
+
+    routeros_api 0.17.0's login() encodes `login`/`password` to bytes when
+    plaintext_login is set, then — if the router answers with a legacy
+    challenge token ('ret', i.e. RouterOS < 6.43, which our RB750r2 on 6.34
+    does) — calls .encode() on those SAME values again in the challenge
+    branch, raising:
+        AttributeError: 'bytes' object has no attribute 'encode'
+
+    It only surfaces on some Python versions (it did NOT occur on the
+    Windows/Python 3.14 dev box but does on Linux/Python 3.10), so it is a
+    latent library bug rather than an environment misconfiguration. Patching
+    site-packages directly works but is lost on any reinstall, so the fix is
+    applied here, at import time, and travels with the code.
+
+    Idempotent and defensive: if a future routeros_api fixes this upstream,
+    or the internals change, the patch simply does not apply.
+    """
+    try:
+        import binascii
+        import hashlib
+        from routeros_api import api as _ros_api
+
+        if getattr(_ros_api.RouterOsApi.login, "_uaf_patched", False):
+            return
+
+        def _as_bytes(v):
+            return v.encode() if isinstance(v, str) else v
+
+        def login(self, login, password, plaintext_login):
+            if plaintext_login:
+                login = _as_bytes(login)
+                password = _as_bytes(password)
+                response = self.get_binary_resource('/').call(
+                    'login', {'name': login, 'password': password})
+            else:
+                response = self.get_binary_resource('/').call('login')
+            # Legacy (pre-6.43) challenge-response step.
+            if 'ret' in response.done_message:
+                token = binascii.unhexlify(response.done_message['ret'])
+                hasher = hashlib.md5()
+                hasher.update(b'\x00')
+                hasher.update(_as_bytes(password))
+                hasher.update(token)
+                hashed = b'00' + hasher.hexdigest().encode('ascii')
+                self.get_binary_resource('/').call(
+                    'login', {'name': _as_bytes(login), 'response': hashed})
+
+        login._uaf_patched = True
+        _ros_api.RouterOsApi.login = login
+    except Exception:  # never let a patch failure break imports
+        pass
+
+
+_patch_routeros_login()
+
+
 def _truthy(value) -> bool:
     """Normalize a RouterOS flag to a real bool.
 

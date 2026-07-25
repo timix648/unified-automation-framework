@@ -7,6 +7,7 @@ Supports: Port control, VLAN management, MAC address queries, port security, and
 
 from netmiko import ConnectHandler
 from typing import Dict, List, Optional, Any
+import os
 import re
 import time
 from datetime import datetime
@@ -88,6 +89,15 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 'session_timeout': 60,
                 'auth_timeout': 30,
                 'banner_timeout': 15,
+                # conn_timeout covers the initial TCP+SSH handshake specifically
+                # (the other timeouts cover later phases). Netmiko's default is
+                # 10s, which is fine on a LAN but not when the switch is reached
+                # across a VPN/WAN: at ~360ms RTT the legacy key exchange on a
+                # 2960 exceeds it and fails with
+                # "Paramiko: 'No existing session' error: try increasing
+                # 'conn_timeout' to 15 seconds or larger." Env-tunable so a
+                # remote deployment can raise it without a code change.
+                'conn_timeout': int(os.getenv('CISCO_CONN_TIMEOUT', '45')),
                 # Old/slow IOS (2960 on 12.2) returns prompts slowly and limits
                 # concurrent SSH sessions. Give Netmiko more patience so a slow
                 # prompt isn't mistaken for a failure ("Pattern not detected").

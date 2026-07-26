@@ -138,7 +138,8 @@ class UniFiDriver(BaseNetworkDriver):
             self.logger.error(f"Disconnect error: {str(e)}")
             return False
     
-    def _api_request(self, endpoint: str, method: str = "GET", data: Optional[Dict] = None) -> Any:
+    def _api_request(self, endpoint: str, method: str = "GET", data: Optional[Dict] = None,
+                     _retrying: bool = False) -> Any:
         """
         Make an API request to UniFi Controller.
         
@@ -193,6 +194,26 @@ class UniFiDriver(BaseNetworkDriver):
             return result
             
         except requests.exceptions.HTTPError as e:
+            # Session invalidation recovery. UniFi controllers cap concurrent
+            # sessions per account and invalidate the older one when a new login
+            # arrives. UAF logs in per operation, so a scheduled scan or a
+            # dashboard poll can silently kill the session a provision is using —
+            # the request then fails with 401 api.err.LoginRequired even though
+            # the credentials and permissions are correct (verified: the same
+            # call succeeds standalone but 401s under app concurrency).
+            # Re-authenticate once and replay the request rather than failing the
+            # whole provisioning step.
+            if (e.response is not None and e.response.status_code == 401
+                    and not _retrying):
+                self.logger.info("UniFi 401 — session likely invalidated; "
+                                 "re-authenticating and retrying once")
+                try:
+                    self.connect()
+                except Exception as ce:
+                    self.logger.error(f"UniFi re-login failed: {ce}")
+                    raise ConnectionError(f"UniFi re-login failed: {ce}")
+                return self._api_request(endpoint, method=method, data=data,
+                                         _retrying=True)
             # Surface the controller's own error message (e.g. api.err.XXX)
             detail = ""
             try:

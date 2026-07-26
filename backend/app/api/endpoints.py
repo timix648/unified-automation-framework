@@ -86,7 +86,7 @@ async def ws_events(websocket: WebSocket, token: str = ""):
                 async def probe(d):
                     host = d.get("ip") or d.get("primary_ip", "")
                     port = _management_port(d)
-                    up = await asyncio.to_thread(_tcp_probe, host, port, 2.0)
+                    up = await asyncio.to_thread(_tcp_probe, host, port, HEALTH_PROBE_TIMEOUT)
                     return d.get("name", host), ("online" if up else "offline")
 
                 results = await asyncio.gather(*[probe(d) for d in devices])
@@ -155,7 +155,15 @@ def _management_port(device: dict) -> int:
     return 22
 
 
-def _tcp_probe(host: str, port: int, timeout: float = 2.0) -> bool:
+# How long a reachability probe may take. 2s suits a LAN, but when devices are
+# reached across a VPN/WAN the TCP handshake plus jitter can exceed it, making
+# healthy devices flap "offline" at random (observed at ~225ms RTT: a different
+# device reported offline on each poll while a manual `nc` always succeeded).
+# Env-tunable so a remote deployment can raise it without a code change.
+HEALTH_PROBE_TIMEOUT = float(os.getenv("HEALTH_PROBE_TIMEOUT", "2.0"))
+
+
+def _tcp_probe(host: str, port: int, timeout: float = HEALTH_PROBE_TIMEOUT) -> bool:
     """Return True if a TCP connection to host:port succeeds within timeout."""
     if not host:
         return False
@@ -299,7 +307,7 @@ async def get_devices_health(current_user: dict = Depends(get_current_user)):
     async def probe(device: dict):
         host = device.get("ip") or device.get("primary_ip", "")
         port = _management_port(device)
-        reachable = await asyncio.to_thread(_tcp_probe, host, port, 2.0)
+        reachable = await asyncio.to_thread(_tcp_probe, host, port, HEALTH_PROBE_TIMEOUT)
         return device.get("name", host), {
             "status": "online" if reachable else "offline",
             "ip": host,

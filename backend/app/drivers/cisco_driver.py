@@ -64,6 +64,28 @@ class CiscoIOSDriver(BaseNetworkDriver):
         super().__init__(device_config, mock_mode)
         self.device_type = "cisco_ios"
         self.connection = None
+        # When True, config steps do not write to flash individually; the
+        # caller is responsible for calling commit() once when finished.
+        self.defer_save = False
+        self._unsaved_changes = False
+
+    def commit(self) -> bool:
+        """Write the running configuration to flash, once.
+
+        Used with defer_save so a multi-step run pays a single flash write
+        instead of one per step. Never raises: the configuration is already
+        live, and a failed save must not turn a successful run into a failure.
+        """
+        if self.mock_mode or not self._unsaved_changes:
+            return True
+        try:
+            self.connection.save_config()
+            self._unsaved_changes = False
+            self.logger.info("Configuration saved to flash")
+            return True
+        except Exception as e:
+            self.logger.warning(f"Deferred save failed (config is live but unsaved): {e}")
+            return False
         
     def connect(self) -> bool:
         print(f"🔎 DEBUG cisco connect(): mock_mode={self.mock_mode} host={self.device_config.get('host')}")
@@ -214,7 +236,7 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # block for many minutes, which is worse than the problem being fixed.
             return self.connection.send_command(
                 command,
-                read_timeout=int(os.getenv("CISCO_VERIFY_READ_TIMEOUT", "25")),
+                read_timeout=int(os.getenv("CISCO_VERIFY_READ_TIMEOUT", "15")),
             ) or ""
         except Exception as e:
             self.logger.warning(f"Verification read failed for '{command}': {e}")
@@ -314,8 +336,11 @@ class CiscoIOSDriver(BaseNetworkDriver):
         # Verification is retried: the switch is often briefly unresponsive
         # right after a write, and a read that cannot complete must not be
         # mistaken for the change being absent.
+        # Two attempts with a short pause. Verification must stay cheap: it
+        # runs after every write, so generous retries turn a fast provision
+        # into a slow one -- the cost the switch can least afford.
         confirmed = None  # True = present, False = absent, None = undetermined
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 confirmed = verify()
             except Exception as e:
@@ -323,8 +348,8 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 confirmed = None
             if confirmed is not None:
                 break
-            if attempt < 2:
-                time.sleep(5)
+            if attempt == 0:
+                time.sleep(2)
 
         if confirmed is True:
             if write_error:
@@ -394,10 +419,20 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 cmd_verify=False,
             )
             
-            # Save configuration
-            self.connection.save_config()
-            
-            self.logger.info(f"Config commands executed and saved")
+            # Persist. On a 2960 'write memory' is a flash write costing
+            # 5-15s AND spiking CPU, which is what makes the NEXT step's
+            # prompt read time out. Doing it after every step therefore
+            # generates the very timeouts that look like failures, and a
+            # 10-step provision spends minutes in flash I/O. When deferred,
+            # the caller saves once via commit() at the end of the run --
+            # which is also more correct, since intermediate saves persist
+            # half-built configuration.
+            if self.defer_save:
+                self._unsaved_changes = True
+                self.logger.info("Config commands executed (save deferred)")
+            else:
+                self.connection.save_config()
+                self.logger.info("Config commands executed and saved")
             return output
             
         except Exception as e:

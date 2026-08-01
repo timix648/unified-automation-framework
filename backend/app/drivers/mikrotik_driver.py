@@ -380,7 +380,29 @@ class MikroTikDriver(BaseNetworkDriver):
             for v in vlan_res.get():
                 if v.get('name') == vlan_name:
                     vlan_res.remove(id=v['id']); removed["vlan"] = True
-            return {"success": True, "removed": removed,
+
+            # Read back rather than assuming. This previously returned success
+            # unconditionally, so a removal that silently did not happen left
+            # the VLAN interface and its DHCP server on the router while the
+            # de-provision reported clean -- exactly how vlan66/77/99 and their
+            # servers accumulated across cycles.
+            leftover = []
+            if any(s.get('name') == f"dhcp-{vlan_id}"
+                   for s in api.get_resource('/ip/dhcp-server').get()):
+                leftover.append(f"dhcp-{vlan_id}")
+            if any(a.get('interface') == vlan_name
+                   for a in api.get_resource('/ip/address').get()):
+                leftover.append(f"address on {vlan_name}")
+            if any(v.get('name') == vlan_name
+                   for v in api.get_resource('/interface/vlan').get()):
+                leftover.append(vlan_name)
+
+            if leftover:
+                raise ConnectionError(
+                    f"delete VLAN {vlan_id} segment incomplete; still present: "
+                    + ", ".join(leftover))
+
+            return {"success": True, "verified": True, "removed": removed,
                     "timestamp": datetime.now().isoformat()}
         except Exception as e:
             self.logger.error(f"delete_vlan_segment failed: {e}")

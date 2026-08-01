@@ -1108,6 +1108,10 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
     for device in cisco_devices:
         try:
             driver = DeviceFactory.get_driver(device)
+            # One flash write for the whole block instead of one per step: on a
+            # 2960 each 'write memory' costs 5-15s and spikes CPU, which is what
+            # makes the following step's prompt read time out.
+            driver.defer_save = True
             driver.connect()
 
             # Replace mode: clear existing operational VLANs first, but keep the
@@ -1166,9 +1170,17 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                             "error": str(e)
                         })
 
+            driver.commit()   # single deferred save for the whole block
             driver.disconnect()
 
         except Exception as e:
+            # Persist whatever did apply before the failure, so a partial run
+            # is not silently lost on the next reload.
+            try:
+                driver.commit()
+                driver.disconnect()
+            except Exception:
+                pass
             results["steps_failed"].append({
                 "step": "cisco_setup",
                 "device": device["name"],
@@ -1316,6 +1328,7 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
         for device in [d for d in devices if "cisco" in d.get("platform", "").lower()]:
             try:
                 driver = DeviceFactory.get_driver(device)
+                driver.defer_save = True   # one flash write for both trunks
                 driver.connect()
 
                 # DISCOVER the uplinks rather than trusting hardcoded ports.
@@ -1371,8 +1384,14 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                             "port": up_port,
                             "error": str(e)
                         })
+                driver.commit()
                 driver.disconnect()
             except Exception as e:
+                try:
+                    driver.commit()
+                    driver.disconnect()
+                except Exception:
+                    pass
                 results["steps_failed"].append({
                     "step": "trunk_uplinks",
                     "device": device["name"],

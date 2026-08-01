@@ -661,11 +661,57 @@ class UniFiDriver(BaseNetworkDriver):
                 "name": patched.get("name"), "result": result}
 
     def delete_wlan(self, wlan_id: str) -> Dict[str, Any]:
-        """Permanently remove an SSID from the controller."""
+        """Permanently remove an SSID, confirming it is actually gone.
+
+        The controller intermittently answers a write with 401
+        api.err.LoginRequired while it is busy. Previously that was reported
+        as a failed delete and the SSID stayed on the controller -- so the
+        next provision created a SECOND SSID with the same name. The delete
+        is therefore retried after re-authenticating, and the outcome is
+        decided by reading the controller back.
+        """
         endpoint = f"/api/s/{self.site}/rest/wlanconf/{wlan_id}"
-        result = self._api_request(endpoint, method="DELETE")
+        write_error = None
+        for attempt in range(2):
+            try:
+                self._api_request(endpoint, method="DELETE")
+                write_error = None
+                break
+            except Exception as e:
+                write_error = str(e).strip().splitlines()[0] or type(e).__name__
+                if attempt == 0:
+                    time.sleep(2)
+                    try:
+                        self.connect()   # re-authenticate, then retry once
+                    except Exception:
+                        pass
+
+        if self.mock_mode:
+            return {"status": "success", "wlan_id": wlan_id, "verified": False}
+
+        still_there = None
+        try:
+            still_there = any((w.get("id") or w.get("_id")) == wlan_id
+                              for w in self.get_wlan_groups())
+        except Exception as e:
+            self.logger.warning(f"Could not verify deletion of WLAN {wlan_id}: {e}")
+
+        if still_there:
+            raise ConnectionError(
+                f"delete SSID failed: still present on the controller"
+                + (f" ({write_error})" if write_error else ""))
+        if still_there is None and write_error:
+            raise ConnectionError(
+                f"delete SSID failed: {write_error} (and the controller could "
+                f"not be read back to confirm)")
+
+        if write_error:
+            self.logger.info(
+                f"delete WLAN {wlan_id}: write reported '{write_error}' but the "
+                f"controller no longer lists it — reporting success.")
         self.logger.info(f"WLAN {wlan_id} deleted")
-        return {"status": "success", "wlan_id": wlan_id, "result": result}
+        return {"status": "success", "wlan_id": wlan_id, "verified": True,
+                "recovered_from_error": bool(write_error)}
 
     def _default_apgroup_id(self) -> Optional[str]:
         """Resolve the default AP group id from the v2 API.
@@ -849,6 +895,21 @@ class UniFiDriver(BaseNetworkDriver):
             data["ap_group_ids"] = [apgroup]
             data["ap_group_mode"] = "all"
         
+        # Idempotence: the controller happily accepts two WLANs with the SAME
+        # name, so a re-provision (or a provision after a delete that silently
+        # failed) produced duplicate SSIDs. Remove any existing WLAN of this
+        # name first, so the result is one SSID matching the request rather
+        # than an accumulating pile.
+        if not self.mock_mode:
+            try:
+                for existing in self.get_wlan_groups():
+                    if existing.get("name") == ssid:
+                        eid = existing.get("id") or existing.get("_id")
+                        self.logger.info(f"Removing existing SSID '{ssid}' before recreating")
+                        self.delete_wlan(eid)
+            except Exception as e:
+                self.logger.warning(f"Could not clear existing SSID '{ssid}': {e}")
+
         # WRITE-THEN-VERIFY. The controller intermittently answers a write with
         # 401 api.err.LoginRequired while it is busy (e.g. provisioning a
         # freshly adopted AP) even though the SSID is created. Reporting the

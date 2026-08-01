@@ -11,7 +11,7 @@ FIXES APPLIED:
 - Added structured audit log entries with severity levels
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 import os
 import bcrypt
@@ -107,9 +107,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     to_encode = data.copy()
 
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        # Timezone-aware UTC: datetime.utcnow() returns a naive datetime and is
+        # deprecated for removal. PyJWT encodes "exp" as a UTC timestamp, which
+        # an aware datetime gives unambiguously.
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
 
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
@@ -384,11 +387,21 @@ class UserDatabase:
             "user": ["read"]
         }
 
+        # Reject unknown roles rather than silently granting read-only access.
+        # Previously any string was accepted -- a typo such as "opperator" or
+        # "Admin" created an account that looked correct in the user list but
+        # silently carried viewer permissions, so the account would fail to do
+        # its job for reasons invisible to the administrator who created it.
+        if role not in role_permissions:
+            raise ValueError(
+                f"Unknown role '{role}'. Valid roles: {', '.join(sorted(role_permissions))}"
+            )
+
         user = {
             "username": username,
             "hashed_password": hash_password(password),
             "role": role,
-            "permissions": role_permissions.get(role, ["read"])
+            "permissions": role_permissions[role]
         }
 
         self.users[username] = user

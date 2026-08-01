@@ -287,7 +287,13 @@ async def get_all_devices(current_user: dict = Depends(get_current_user)):
     try:
         nb = NetboxInventory()
         devices = nb.get_all_devices()
-        return {"status": "success", "count": len(devices), "devices": devices}
+        # inventory_available distinguishes "this network has no devices" from
+        # "the source of truth could not be reached". Both previously returned
+        # an empty list with status "success". Added as extra fields rather
+        # than a different status code so existing clients are unaffected.
+        return {"status": "success", "count": len(devices), "devices": devices,
+                "inventory_available": nb.last_error is None,
+                "inventory_error": nb.last_error}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1003,18 +1009,57 @@ async def wake_segment(request: WoLSegmentRequest,
         raise HTTPException(status_code=404, detail="Device not found")
     broadcast = request.broadcast_ip or _subnet_broadcast(
         device.get("primary_ip") or device.get("ip", ""))
-    # A segment wake floods the broadcast with a packet whose payload MAC is the
-    # broadcast MAC; every WoL NIC on the segment receives the frame.
+
+    # A magic packet only wakes the NIC whose OWN address appears in the
+    # payload -- the format is 6 x 0xFF followed by the TARGET MAC repeated 16
+    # times. Sending one packet whose payload MAC is FF:FF:FF:FF:FF:FF matches
+    # no NIC and therefore wakes nothing, however widely it is broadcast.
+    # So the segment is woken by reading the switch's forwarding table and
+    # sending one correctly addressed packet per host it has seen.
     try:
-        send_magic_packet("FF:FF:FF:FF:FF:FF", broadcast)
-        audit_logger.log_security_event(
-            "WOL_SEGMENT_SENT",
-            f"Segment wake broadcast to {broadcast} via {request.device_name}")
-        return {"status": "success",
-                "message": f"Segment wake sent across {broadcast}",
-                "broadcast_ip": broadcast, "device": request.device_name}
+        driver = DeviceFactory.get_driver(device)
+        driver.connect()
+        try:
+            mac_table = driver.get_mac_address_table()
+        finally:
+            driver.disconnect()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read MAC address table from {request.device_name}: {e}")
+
+    targets = []
+    for entry in mac_table:
+        mac = (entry.get("mac_address") or "").strip()
+        if not mac or mac in targets:
+            continue
+        try:
+            first_octet = int(mac.replace(":", "").replace("-", "").replace(".", "")[:2], 16)
+        except ValueError:
+            continue
+        # Skip broadcast and multicast addresses (low bit of the first octet):
+        # no individual host owns them, so they cannot be woken.
+        if first_octet & 1:
+            continue
+        targets.append(mac)
+
+    sent, failed = 0, 0
+    for mac in targets:
+        try:
+            send_magic_packet(mac, broadcast)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    audit_logger.log_security_event(
+        "WOL_SEGMENT_SENT",
+        f"Segment wake via {request.device_name}: {sent}/{len(targets)} hosts "
+        f"addressed across {broadcast}")
+    return {"status": "success",
+            "message": f"Segment wake sent to {sent} host(s) across {broadcast}",
+            "broadcast_ip": broadcast, "device": request.device_name,
+            "hosts_addressed": sent, "hosts_failed": failed,
+            "hosts_found": len(targets)}
 
 
 # ============================================================================

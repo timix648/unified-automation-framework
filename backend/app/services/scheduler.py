@@ -222,6 +222,29 @@ def auto_scan_for_rogues():
     try:
         # 1. Get Trusted MACs
         nb = NetboxInventory()
+
+        # Guard: if the source of truth is unreachable the device list comes
+        # back empty, the scan then inspects nothing and finds no rogues, and
+        # the result is indistinguishable from a genuinely clean network. Say
+        # so loudly and abandon the scan rather than implying all-clear.
+        inventory = nb.get_all_devices()
+        # last_error is Optional[str]: only an actual error message counts as a
+        # failure. Testing "is not None" would also trip on a stand-in object.
+        inventory_error = getattr(nb, "last_error", None)
+        if isinstance(inventory_error, str) and inventory_error:
+            logger.error(
+                "[SCHEDULER] Security scan ABORTED — device inventory unavailable "
+                f"({inventory_error}). No devices were scanned; this is NOT an "
+                "all-clear result."
+            )
+            return
+        if isinstance(inventory, list) and not inventory:
+            logger.warning(
+                "[SCHEDULER] Security scan found no devices in inventory — "
+                "nothing was scanned."
+            )
+            return
+
         trusted_macs = nb.get_trusted_macs()
         # Safety whitelist for demo
         trusted_macs.extend(["AA:BB:CC:DD:EE:FF", "00:11:22:33:44:55"])

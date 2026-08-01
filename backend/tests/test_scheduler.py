@@ -145,38 +145,87 @@ class TestAutoScanForRogues:
         # Kill switch should NOT be invoked when network is clean
         mock_ks_cls.assert_not_called()
 
-    @patch.object(scheduler_mod, "KillSwitchService")
-    @patch.object(scheduler_mod, "NornirManager")
-    @patch.object(scheduler_mod, "NetboxInventory")
-    def test_rogue_triggers_kill_switch(self, mock_nb_cls, mock_nornir_cls, mock_ks_cls):
-        mock_nb = MagicMock()
-        mock_nb.get_trusted_macs.return_value = []
-        mock_nb_cls.return_value = mock_nb
+    # A rogue detection does NOT unconditionally shut a port. Enforcement
+    # requires BOTH that enforcement is armed AND that the unrecognized device
+    # is infrastructure (a rogue switch/AP). End-user devices and devices whose
+    # vendor cannot be identified are recorded for review but never isolated,
+    # so a real user is not knocked offline on a guess. The three tests below
+    # pin each arm of that decision.
 
-        mock_mgr = MagicMock()
-        mock_mgr.scan_all_for_rogues.return_value = {
+    def _scan_returning(self, mac, interface="Gi0/5"):
+        return {
             "total_rogues_found": 1,
             "details": {
                 "results": {
                     "cisco-switch-01": {
                         "success": True,
-                        "result": {
-                            "rogue_devices": [{"mac": "DE:AD:BE:EF:00:01", "interface": "Gi0/5"}]
-                        },
+                        "result": {"rogue_devices": [{"mac": mac, "interface": interface}]},
                     }
                 }
             },
         }
-        mock_nornir_cls.return_value = mock_mgr
 
-        mock_ks = MagicMock()
-        mock_ks_cls.return_value = mock_ks
+    @patch.object(scheduler_mod, "enforcement_state")
+    @patch.object(scheduler_mod, "KillSwitchService")
+    @patch.object(scheduler_mod, "NornirManager")
+    @patch.object(scheduler_mod, "NetboxInventory")
+    def test_learning_mode_records_but_never_shuts_port(
+        self, mock_nb_cls, mock_nornir_cls, mock_ks_cls, mock_enforcement
+    ):
+        """Learning mode must report the device and shut nothing."""
+        mock_enforcement.is_armed.return_value = False
+        mock_nb_cls.return_value.get_trusted_macs.return_value = []
+        # Ubiquiti OUI -> classified as infrastructure, so the ONLY thing
+        # preventing isolation here is that enforcement is not armed.
+        mock_nornir_cls.return_value.scan_all_for_rogues.return_value = \
+            self._scan_returning("F0:9F:C2:11:22:33")
+        mock_ks = mock_ks_cls.return_value
 
         scheduler_mod.auto_scan_for_rogues()
 
-        mock_ks.execute_response.assert_called_once_with(
-            device_name="cisco-switch-01",
-            port_id="Gi0/5",
-            threat_type="rogue_device_scheduled_scan",
-            threat_details={"mac_address": "DE:AD:BE:EF:00:01"},
-        )
+        mock_ks.execute_response.assert_not_called()
+        mock_ks.record_detection.assert_called_once()
+
+    @patch.object(scheduler_mod, "enforcement_state")
+    @patch.object(scheduler_mod, "KillSwitchService")
+    @patch.object(scheduler_mod, "NornirManager")
+    @patch.object(scheduler_mod, "NetboxInventory")
+    def test_armed_isolates_rogue_infrastructure(
+        self, mock_nb_cls, mock_nornir_cls, mock_ks_cls, mock_enforcement
+    ):
+        """Armed + infrastructure is the one combination that shuts a port."""
+        mock_enforcement.is_armed.return_value = True
+        mock_nb_cls.return_value.get_trusted_macs.return_value = []
+        mock_nornir_cls.return_value.scan_all_for_rogues.return_value = \
+            self._scan_returning("F0:9F:C2:11:22:33")
+        mock_ks = mock_ks_cls.return_value
+
+        scheduler_mod.auto_scan_for_rogues()
+
+        mock_ks.execute_response.assert_called_once()
+        kwargs = mock_ks.execute_response.call_args.kwargs
+        assert kwargs["device_name"] == "cisco-switch-01"
+        assert kwargs["port_id"] == "Gi0/5"
+        assert kwargs["threat_type"] == "rogue_infrastructure_scheduled_scan"
+        assert kwargs["threat_details"]["mac_address"] == "F0:9F:C2:11:22:33"
+        assert kwargs["threat_details"]["device_type"] == "infrastructure"
+
+    @patch.object(scheduler_mod, "enforcement_state")
+    @patch.object(scheduler_mod, "KillSwitchService")
+    @patch.object(scheduler_mod, "NornirManager")
+    @patch.object(scheduler_mod, "NetboxInventory")
+    def test_armed_does_not_isolate_unclassified_endpoint(
+        self, mock_nb_cls, mock_nornir_cls, mock_ks_cls, mock_enforcement
+    ):
+        """Armed, but an unidentifiable device is recorded, not isolated."""
+        mock_enforcement.is_armed.return_value = True
+        mock_nb_cls.return_value.get_trusted_macs.return_value = []
+        # Unassigned OUI -> classified "unknown", so it must NOT be isolated.
+        mock_nornir_cls.return_value.scan_all_for_rogues.return_value = \
+            self._scan_returning("DE:AD:BE:EF:00:01")
+        mock_ks = mock_ks_cls.return_value
+
+        scheduler_mod.auto_scan_for_rogues()
+
+        mock_ks.execute_response.assert_not_called()
+        mock_ks.record_detection.assert_called_once()

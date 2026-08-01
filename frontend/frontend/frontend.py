@@ -1614,7 +1614,10 @@ class State(rx.State):
                 r = await client.post(
                     f"{API_BASE}/power/wake-batch",
                     headers=self._headers(),
-                    json={"macs": macs, "broadcast_ip": "192.168.1.255"},
+                    # No broadcast address is sent: the backend derives one per
+                    # live interface at run time. Pinning it here to a single
+                    # subnet breaks the moment the host is on another network.
+                    json={"macs": macs},
                 )
                 r.raise_for_status()
                 data = r.json()

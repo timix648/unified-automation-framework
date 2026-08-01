@@ -14,7 +14,44 @@ FIXED:
 """
 
 import os
+import sys
 from dotenv import load_dotenv
+
+
+def _make_console_encoding_safe() -> None:
+    """Stop unencodable characters in log/print output from raising.
+
+    Several modules print status lines containing emoji. When stdout cannot
+    represent them -- a Windows console under cp1252, or any redirected/piped
+    stream on a non-UTF-8 locale -- ``print`` raises UnicodeEncodeError. That
+    exception surfaces INSIDE the code path doing the work, not merely in the
+    logging: in kill_switch.execute_kill_switch the status line is printed
+    before driver.shutdown_port(), so the port was never actually shut.
+
+    Switching the streams to errors="replace" makes unrepresentable characters
+    degrade to "?" instead of raising. The console's own encoding is left
+    untouched, so UTF-8 terminals (Linux, Docker) keep rendering emoji exactly
+    as before. This is deliberately non-fatal: if the streams cannot be
+    reconfigured we carry on rather than block startup.
+    """
+    # Error handlers that already degrade instead of raising. Anything else --
+    # including "strict" AND the "surrogateescape" that Python uses by default
+    # for a redirected stream -- raises on an unencodable character such as an
+    # emoji, so it must be switched.
+    non_raising = {"replace", "ignore", "backslashreplace", "xmlcharrefreplace"}
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if hasattr(stream, "reconfigure") and getattr(stream, "errors", None) not in non_raising:
+                stream.reconfigure(errors="replace")
+        except (ValueError, OSError, AttributeError):
+            # Detached, already closed, or a stream that does not support it.
+            pass
+
+
+# Applied on import. config.py is imported by every module that emits these
+# status lines, so this single call covers the whole backend regardless of
+# which entry point started it.
+_make_console_encoding_safe()
 
 # Load the .env file
 load_dotenv()
@@ -54,6 +91,16 @@ class Settings:
     MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
     MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
     MQTT_TOPIC = os.getenv("MQTT_TOPIC", "uaf/wol/commands")
+
+    # --- WoL Bridge (remote/cloud deployment) ---
+    # A magic packet is a link-local broadcast: it cannot be routed to the lab
+    # from a cloud host, so a backend running off-site can never wake anything
+    # by sending the packet itself. Point this at the bridge agent running on
+    # a machine INSIDE the target network (e.g. "http://100.x.y.z:5001") and
+    # wake requests are relayed there instead.
+    # Empty (the default) keeps the original behaviour: send locally.
+    WOL_BRIDGE_URL = os.getenv("WOL_BRIDGE_URL", "").rstrip("/")
+    WOL_BRIDGE_TIMEOUT = float(os.getenv("WOL_BRIDGE_TIMEOUT", "5"))
 
     # --- JWT Authentication ---
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "")

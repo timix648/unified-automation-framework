@@ -76,3 +76,4 @@ isort==5.13.2
 # Documentation
 mkdocs==1.5.3
 mkdocs-material==9.5.3
+psutil==7.2.2  # network interface enumeration for Wake-on-LAN delivery

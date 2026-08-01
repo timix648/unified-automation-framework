@@ -83,6 +83,11 @@ class NetboxInventory:
     def __init__(self):
         self.use_api = False
         self.nb = None
+        # Records why the last inventory read failed, or None if it succeeded.
+        # An unreachable NetBox previously returned an empty device list that
+        # was indistinguishable from "this network genuinely has no devices" --
+        # so a security scan could report all-clear having scanned nothing.
+        self.last_error: Optional[str] = None
         if settings.NETBOX_URL and settings.NETBOX_TOKEN and not settings.MOCK_MODE:
             try:
                 import pynetbox
@@ -143,9 +148,11 @@ class NetboxInventory:
                             if creds:
                                 device_data['credentials'] = creds
                         devices.append(device_data)
+                self.last_error = None
                 return devices
             except Exception as e:
                 print(f"Error fetching from NetBox API: {e}")
+                self.last_error = str(e)
                 return []
         else:
             # Dev: Read local JSON

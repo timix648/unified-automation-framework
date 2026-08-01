@@ -10,6 +10,22 @@ import os
 # keeps the test suite deterministic and self-contained regardless of .env.
 os.environ["MOCK_MODE"] = "True"
 
+# Redirect the persisted user store to a throwaway file BEFORE app modules are
+# imported (UserManager reads USER_STORE_FILE when it is constructed).
+#
+# Without this the suite writes into the REAL store at app/data/users.json:
+# tests create accounts and change their passwords, those records persist, and
+# the next run fails because the account already exists with a different
+# password. That made the suite non-repeatable -- it passed once on a clean
+# store and failed on every subsequent run. Tests must never mutate real state.
+import atexit
+import shutil
+import tempfile
+
+_TEST_USER_STORE_DIR = tempfile.mkdtemp(prefix="uaf-test-users-")
+os.environ["USER_STORE_FILE"] = os.path.join(_TEST_USER_STORE_DIR, "users.json")
+atexit.register(shutil.rmtree, _TEST_USER_STORE_DIR, True)
+
 import sys
 from unittest.mock import MagicMock
 

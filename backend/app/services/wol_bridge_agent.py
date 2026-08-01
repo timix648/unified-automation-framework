@@ -252,18 +252,33 @@ class WoLLocalBridge:
             
             # Convert MAC address to bytes
             mac_bytes = bytes.fromhex(mac_address)
-            
+
             # Build magic packet: 6 bytes of 0xFF + 16 repetitions of MAC
             magic_packet = b'\xFF' * 6 + mac_bytes * 16
-            
-            # Create UDP socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            
-            # Send the packet
-            sock.sendto(magic_packet, (broadcast_ip, port))
-            sock.close()
-            
+
+            # Delivery: this agent runs on a host inside the target network,
+            # which is typically multi-homed (Wi-Fi + Ethernet + VPN + a WSL or
+            # Hyper-V virtual switch). A single send to 255.255.255.255 lets the
+            # routing table pick ONE interface, frequently a virtual adapter
+            # with no physical network behind it. Reuse the shared sender, which
+            # transmits out of every live interface, when it is importable.
+            sent_via_shared = False
+            try:
+                from app.services.wol import send_magic_packet as _shared_send
+                # use_bridge=False: this IS the bridge; relaying would loop.
+                _shared_send(mac_address, broadcast_ip, port, use_bridge=False)
+                sent_via_shared = True
+            except Exception:
+                # Running as a standalone copy without the app package, or the
+                # shared sender failed: fall back to the original direct send.
+                sent_via_shared = False
+
+            if not sent_via_shared:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.sendto(magic_packet, (broadcast_ip, port))
+                sock.close()
+
             self.stats['packets_sent'] += 1
             
             self.logger.info(f"🔌 Magic packet sent:")

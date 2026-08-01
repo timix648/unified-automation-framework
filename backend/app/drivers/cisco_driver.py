@@ -193,35 +193,68 @@ class CiscoIOSDriver(BaseNetworkDriver):
     # state it is actually in.
     # ------------------------------------------------------------------
 
-    def _read_quietly(self, command: str) -> str:
-        """Run a show command for verification. Never raises: a failed read
-        means 'could not confirm', which the caller treats as unverified."""
+    def _read_quietly(self, command: str) -> Optional[str]:
+        """Run a show command for verification.
+
+        Returns None when the read itself could not be completed, which is
+        NOT the same as an empty result: a slow switch that fails to answer
+        must not be mistaken for a switch reporting the change is absent.
+        """
         if self.mock_mode:
             return self._get_mock_output(command)
+        if not self.connection:
+            return None
         try:
-            return self._execute_command(command, enable_mode=True) or ""
+            if not self.connection.check_enable_mode():
+                self.connection.enable()
+            # A short, SEPARATE timeout. These are single 'show' commands that
+            # answer in a second or two; they must not inherit CISCO_READ_TIMEOUT,
+            # which is sized for multi-command config sets over a slow link. With
+            # the config timeout (and retries) a single unverifiable step could
+            # block for many minutes, which is worse than the problem being fixed.
+            return self.connection.send_command(
+                command,
+                read_timeout=int(os.getenv("CISCO_VERIFY_READ_TIMEOUT", "25")),
+            ) or ""
         except Exception as e:
             self.logger.warning(f"Verification read failed for '{command}': {e}")
-            return ""
+            return None
 
-    def verify_vlan_exists(self, vlan_id: int) -> bool:
-        """True if the VLAN is present in the switch's VLAN database."""
+    def verify_vlan_exists(self, vlan_id: int) -> Optional[bool]:
+        """True/False if the VLAN is present; None if it could not be checked."""
         if self.mock_mode:
             return True
         out = self._read_quietly(f"show vlan id {vlan_id}")
-        if not out or "not found" in out.lower():
+        if out is None:
+            return None
+        if "not found" in out.lower():
             return False
         return any(line.strip().startswith(str(vlan_id)) for line in out.splitlines())
 
-    def verify_port_access_vlan(self, port_id: str, vlan_id: int) -> bool:
-        """True if the access port carries the expected VLAN."""
+    def verify_port_access_vlan(self, port_id: str, vlan_id: int) -> Optional[bool]:
+        """True/False if the access port is a member of the VLAN; None if unreadable.
+
+        Uses 'show vlan id <n>', which lists the VLAN's member ports and answers
+        in about a second. 'show running-config interface' would be the obvious
+        choice but takes over 25s on this switch and therefore usually returns
+        undetermined -- a verification that cannot complete is worthless.
+        """
         if self.mock_mode:
             return True
-        out = self._read_quietly(f"show running-config interface {port_id}")
-        return f"switchport access vlan {vlan_id}" in out
+        out = self._read_quietly(f"show vlan id {vlan_id}")
+        if out is None:
+            return None
+        if "not found" in out.lower():
+            return False
+        short = port_id.replace("FastEthernet", "Fa").replace("GigabitEthernet", "Gi")
+        # Ports appear as a comma-separated list, e.g. "Fa0/13, Fa0/14".
+        # Match on token boundaries so Fa0/1 does not match Fa0/13.
+        return any(tok.strip() == short
+                   for line in out.splitlines()
+                   for tok in line.replace(",", " ").split())
 
-    def verify_trunk_carries_vlan(self, port_id: str, vlan_id: int) -> bool:
-        """True if the trunk's allowed list includes the VLAN.
+    def verify_trunk_carries_vlan(self, port_id: str, vlan_id: int) -> Optional[bool]:
+        """True/False if the trunk carries the VLAN; None if unreadable.
 
         Reads the operational trunk table rather than the running-config,
         because IOS stores the allowed list as ranges ("1-87,89-98") that a
@@ -236,6 +269,8 @@ class CiscoIOSDriver(BaseNetworkDriver):
         if self.mock_mode:
             return True
         out = self._read_quietly("show interfaces trunk")
+        if out is None:
+            return None
         short = port_id.replace("FastEthernet", "Fa").replace("GigabitEthernet", "Gi")
         in_active_section = False
         for line in out.splitlines():
@@ -276,13 +311,22 @@ class CiscoIOSDriver(BaseNetworkDriver):
         except Exception as e:
             write_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
 
-        confirmed = False
-        try:
-            confirmed = bool(verify())
-        except Exception as e:
-            self.logger.warning(f"Verification of {description} raised: {e}")
+        # Verification is retried: the switch is often briefly unresponsive
+        # right after a write, and a read that cannot complete must not be
+        # mistaken for the change being absent.
+        confirmed = None  # True = present, False = absent, None = undetermined
+        for attempt in range(3):
+            try:
+                confirmed = verify()
+            except Exception as e:
+                self.logger.warning(f"Verification of {description} raised: {e}")
+                confirmed = None
+            if confirmed is not None:
+                break
+            if attempt < 2:
+                time.sleep(5)
 
-        if confirmed:
+        if confirmed is True:
             if write_error:
                 self.logger.info(
                     f"{description}: write reported '{write_error}' but the device "
@@ -291,14 +335,25 @@ class CiscoIOSDriver(BaseNetworkDriver):
                     "recovered_from_error": bool(write_error),
                     "write_error": write_error}
 
-        # Not confirmed. If the write also raised, that is a genuine failure.
-        if write_error:
-            raise ConnectionError(f"{description} failed: {write_error}")
-        # Write returned cleanly but the device does not show the change.
-        return {"success": False, "verified": False,
-                "recovered_from_error": False,
-                "write_error": f"{description}: applied without error but the device "
-                               f"does not show the expected state"}
+        if confirmed is False:
+            # The device positively reports the change is NOT there.
+            raise ConnectionError(
+                f"{description} failed: device does not show the change"
+                + (f" ({write_error})" if write_error else ""))
+
+        # confirmed is None: could not read the device back.
+        if not write_error:
+            # The write itself completed cleanly, so trust it rather than
+            # inventing a failure because the follow-up read timed out.
+            self.logger.warning(
+                f"{description}: applied cleanly but could not be verified "
+                f"(device unreadable) — reporting success, unverified.")
+            return {"success": True, "verified": False,
+                    "recovered_from_error": False, "write_error": None,
+                    "unverified": True}
+        raise ConnectionError(
+            f"{description} failed: {write_error} (and the device could not be "
+            f"read back to confirm)")
 
     def _execute_config_commands(self, commands: List[str]) -> str:
         """

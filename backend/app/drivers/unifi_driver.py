@@ -10,6 +10,7 @@ import urllib3
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
+import time
 
 from .base_driver import BaseNetworkDriver
 
@@ -859,27 +860,42 @@ class UniFiDriver(BaseNetworkDriver):
         except Exception as e:
             write_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
 
-        if self.mock_mode:
-            created = True  # nothing real to read back
-        else:
-            created = False
-            try:
-                created = any(w.get("name") == ssid for w in self.get_wlan_groups())
-            except Exception as e:
-                self.logger.warning(f"Could not verify SSID '{ssid}': {e}")
+        # Tri-state: True = listed, False = definitely absent, None = the
+        # controller could not be read. A read that fails must not be treated
+        # as "the SSID was not created".
+        created = True if self.mock_mode else None
+        if not self.mock_mode:
+            for attempt in range(3):
+                try:
+                    created = any(w.get("name") == ssid for w in self.get_wlan_groups())
+                    break
+                except Exception as e:
+                    self.logger.warning(f"Could not verify SSID '{ssid}': {e}")
+                    created = None
+                    if attempt < 2:
+                        time.sleep(5)
 
-        if not created:
+        if created is False:
             raise ConnectionError(
-                f"create SSID '{ssid}' failed: {write_error or 'controller does not list the SSID'}")
+                f"create SSID '{ssid}' failed: controller does not list the SSID"
+                + (f" ({write_error})" if write_error else ""))
 
-        if write_error:
+        if created is None:
+            if write_error:
+                raise ConnectionError(
+                    f"create SSID '{ssid}' failed: {write_error} (and the controller "
+                    f"could not be read back to confirm)")
+            self.logger.warning(
+                f"create SSID '{ssid}': created cleanly but could not be verified.")
+
+        if write_error and created:
             self.logger.info(
                 f"create SSID '{ssid}': write reported '{write_error}' but the "
                 f"controller lists it — reporting success.")
 
         return {
             "success": True,
-            "verified": True,
+            "verified": bool(created),
             "recovered_from_error": bool(write_error),
             "write_error": write_error,
             "ssid": ssid,

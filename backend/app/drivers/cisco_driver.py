@@ -336,20 +336,23 @@ class CiscoIOSDriver(BaseNetworkDriver):
         # Verification is retried: the switch is often briefly unresponsive
         # right after a write, and a read that cannot complete must not be
         # mistaken for the change being absent.
-        # Two attempts with a short pause. Verification must stay cheap: it
-        # runs after every write, so generous retries turn a fast provision
-        # into a slow one -- the cost the switch can least afford.
+        # Retry on "absent" as well as on "undetermined". This switch will
+        # accept a write, answer the very next read WITHOUT the change, and
+        # commit it a moment later -- so a negative taken immediately after a
+        # write is not trustworthy and previously produced false failures for
+        # changes that were live. Only a negative that survives a re-check is
+        # believed. Kept to three cheap reads so verification stays fast.
         confirmed = None  # True = present, False = absent, None = undetermined
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 confirmed = verify()
             except Exception as e:
                 self.logger.warning(f"Verification of {description} raised: {e}")
                 confirmed = None
-            if confirmed is not None:
+            if confirmed is True:
                 break
-            if attempt == 0:
-                time.sleep(2)
+            if attempt < 2:
+                time.sleep(3)
 
         if confirmed is True:
             if write_error:

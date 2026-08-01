@@ -660,6 +660,32 @@ class UniFiDriver(BaseNetworkDriver):
         return {"status": "success", "wlan_id": wlan_id,
                 "name": patched.get("name"), "result": result}
 
+    def _write_with_retry(self, endpoint: str, method: str,
+                          data: Optional[Dict] = None, attempts: int = 3):
+        """Perform a write, re-authenticating and backing off on failure.
+
+        The controller answers writes with 401 api.err.LoginRequired while it
+        is busy -- observed for stretches longer than a single retry covers,
+        which caused a create and a delete to fail in the same cycle. Each
+        retry re-authenticates first, since the session is what the controller
+        is rejecting, and waits a little longer than the last.
+
+        Returns (result, error): error is None when the write succeeded.
+        """
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                return self._api_request(endpoint, method=method, data=data), None
+            except Exception as e:
+                last_error = str(e).strip().splitlines()[0] or type(e).__name__
+                if attempt < attempts - 1:
+                    time.sleep(2 * (attempt + 1))   # 2s, then 4s
+                    try:
+                        self.connect()
+                    except Exception:
+                        pass
+        return None, last_error
+
     def delete_wlan(self, wlan_id: str) -> Dict[str, Any]:
         """Permanently remove an SSID, confirming it is actually gone.
 
@@ -671,20 +697,7 @@ class UniFiDriver(BaseNetworkDriver):
         decided by reading the controller back.
         """
         endpoint = f"/api/s/{self.site}/rest/wlanconf/{wlan_id}"
-        write_error = None
-        for attempt in range(2):
-            try:
-                self._api_request(endpoint, method="DELETE")
-                write_error = None
-                break
-            except Exception as e:
-                write_error = str(e).strip().splitlines()[0] or type(e).__name__
-                if attempt == 0:
-                    time.sleep(2)
-                    try:
-                        self.connect()   # re-authenticate, then retry once
-                    except Exception:
-                        pass
+        _, write_error = self._write_with_retry(endpoint, "DELETE")
 
         if self.mock_mode:
             return {"status": "success", "wlan_id": wlan_id, "verified": False}
@@ -915,11 +928,7 @@ class UniFiDriver(BaseNetworkDriver):
         # freshly adopted AP) even though the SSID is created. Reporting the
         # write's response as the outcome therefore produces false failures, so
         # the controller is asked what actually exists before deciding.
-        write_error = None
-        try:
-            self._api_request(endpoint, method="POST", data=data)
-        except Exception as e:
-            write_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        _, write_error = self._write_with_retry(endpoint, "POST", data=data)
 
         # Tri-state: True = listed, False = definitely absent, None = the
         # controller could not be read. A read that fails must not be treated

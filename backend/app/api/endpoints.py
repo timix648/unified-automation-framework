@@ -1658,12 +1658,22 @@ async def deprovision_network(request: DeprovisionRequest,
         try:
             drv = DeviceFactory.get_driver(device)
             drv.connect()
-            res = drv.delete_dhcp_network(request.network_name, request.subnet)
-            results["steps_completed"].append(
-                {"step": "delete_dhcp_network", "device": device["name"], "result": res})
+            try:
+                res = drv.delete_dhcp_network(request.network_name, request.subnet)
+                results["steps_completed"].append(
+                    {"step": "delete_dhcp_network", "device": device["name"], "result": res})
+            except Exception as e:
+                results["steps_failed"].append(
+                    {"step": "delete_dhcp_network", "device": device["name"], "error": str(e)})
+
             # Reverse of data-path stitching: remove the segment's DHCP server
-            # instance, gateway address, and VLAN sub-interface. Safe no-op if
-            # the segment was provisioned without stitching.
+            # instance, gateway address, and VLAN sub-interface.
+            #
+            # Runs whether or not the pool/network removal above succeeded. It
+            # used to be nested after it, so a timeout there skipped this
+            # entirely and left vlan<id>, its address and its DHCP server on the
+            # router while de-provision reported done -- which is how leftovers
+            # accumulated across cycles.
             try:
                 sres = drv.delete_vlan_segment(request.vlan_id)
                 results["steps_completed"].append(
@@ -1674,7 +1684,7 @@ async def deprovision_network(request: DeprovisionRequest,
             drv.disconnect()
         except Exception as e:
             results["steps_failed"].append(
-                {"step": "delete_dhcp_network", "device": device["name"], "error": str(e)})
+                {"step": "mikrotik_deprovision", "device": device["name"], "error": str(e)})
 
     # ---- UniFi: delete SSID (if named) ----
     if request.ssid:

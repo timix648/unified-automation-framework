@@ -13,6 +13,8 @@ FIXES APPLIED:
 - Added scan interval as a configurable constant
 """
 
+import os
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from app.inventory.netbox_client import NetboxInventory
 from app.core.nornir_manager import NornirManager
@@ -32,9 +34,17 @@ logger = logging.getLogger("scheduler")
 # Scheduler instance (module-level singleton)
 scheduler = BackgroundScheduler()
 
-# Configurable intervals (minutes)
-TIME_POLICY_INTERVAL_MINUTES = 60
-SECURITY_SCAN_INTERVAL_MINUTES = 5  # FIX: was 2 — too aggressive
+# Configurable intervals (minutes), overridable from .env.
+#
+# The rogue scan opens an SSH session to every switch. A Catalyst 2960 refuses
+# concurrent sessions, so a scan that fires while an operator is provisioning
+# takes the switch's only session and the provisioning steps fail with
+# "No existing session" / "Pattern not detected" -- errors that look like
+# latency faults but are really contention. Raising the interval (or setting
+# SECURITY_SCAN_INTERVAL_MINUTES=0 to disable the scan entirely) gives a
+# demonstration a quiet window. Automated response is unaffected when enabled.
+TIME_POLICY_INTERVAL_MINUTES = int(os.getenv("TIME_POLICY_INTERVAL_MINUTES", "60"))
+SECURITY_SCAN_INTERVAL_MINUTES = int(os.getenv("SECURITY_SCAN_INTERVAL_MINUTES", "5"))
 
 
 def auto_enforce_time_policy():
@@ -375,15 +385,21 @@ def start_scheduler():
         name='Time-Based Access Policy'
     )
 
-    # Job 2: Scan for Security Threats every 5 minutes
-    scheduler.add_job(
-        auto_scan_for_rogues,
-        'interval',
-        minutes=SECURITY_SCAN_INTERVAL_MINUTES,
-        id='rogue_scan',
-        replace_existing=True,
-        name='Rogue Device Security Scan'
-    )
+    # Job 2: Scan for Security Threats. Setting the interval to 0 disables the
+    # periodic scan (manual scans via /api/security/scan still work), which
+    # keeps a demonstration free of SSH contention on the switch.
+    if SECURITY_SCAN_INTERVAL_MINUTES > 0:
+        scheduler.add_job(
+            auto_scan_for_rogues,
+            'interval',
+            minutes=SECURITY_SCAN_INTERVAL_MINUTES,
+            id='rogue_scan',
+            replace_existing=True,
+            name='Rogue Device Security Scan'
+        )
+    else:
+        logger.warning("[SYSTEM] Periodic rogue scan DISABLED "
+                       "(SECURITY_SCAN_INTERVAL_MINUTES=0). Manual scans still available.")
 
     scheduler.start()
     logger.info(f"[SYSTEM] Background Scheduler Started.")

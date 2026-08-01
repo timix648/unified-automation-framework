@@ -10,7 +10,9 @@
 #     ports: ["9090:9090"]
 #     networks: [uaf-network]
 #
-# Grafana (infra/grafana) on top of this is Chapter 5.3 future work — optional.
+# UAF exports metrics in Prometheus format at /api/metrics; this file configures
+# the scrape. Visualisation on top (Grafana or otherwise) is deliberately out of
+# scope -- the metrics endpoint is the deliverable.
 
 global:
   scrape_interval: 15s

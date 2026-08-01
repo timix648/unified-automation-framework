@@ -180,6 +180,126 @@ class CiscoIOSDriver(BaseNetworkDriver):
             self.logger.error(f"Command execution failed: {str(e)}")
             raise
     
+    # ------------------------------------------------------------------
+    # WRITE-THEN-VERIFY
+    #
+    # A slow switch frequently applies a configuration change and then fails
+    # to return its prompt inside the read timeout. Netmiko raises
+    # "Pattern not detected", the step is reported as failed, and the change
+    # is in fact live on the device. Deciding success from "did the write call
+    # return cleanly" therefore produces false failures -- observed three
+    # times in a single 12-step provision on a LAN, where latency plays no
+    # part. The fix is to stop trusting the write call and ask the device what
+    # state it is actually in.
+    # ------------------------------------------------------------------
+
+    def _read_quietly(self, command: str) -> str:
+        """Run a show command for verification. Never raises: a failed read
+        means 'could not confirm', which the caller treats as unverified."""
+        if self.mock_mode:
+            return self._get_mock_output(command)
+        try:
+            return self._execute_command(command, enable_mode=True) or ""
+        except Exception as e:
+            self.logger.warning(f"Verification read failed for '{command}': {e}")
+            return ""
+
+    def verify_vlan_exists(self, vlan_id: int) -> bool:
+        """True if the VLAN is present in the switch's VLAN database."""
+        if self.mock_mode:
+            return True
+        out = self._read_quietly(f"show vlan id {vlan_id}")
+        if not out or "not found" in out.lower():
+            return False
+        return any(line.strip().startswith(str(vlan_id)) for line in out.splitlines())
+
+    def verify_port_access_vlan(self, port_id: str, vlan_id: int) -> bool:
+        """True if the access port carries the expected VLAN."""
+        if self.mock_mode:
+            return True
+        out = self._read_quietly(f"show running-config interface {port_id}")
+        return f"switchport access vlan {vlan_id}" in out
+
+    def verify_trunk_carries_vlan(self, port_id: str, vlan_id: int) -> bool:
+        """True if the trunk's allowed list includes the VLAN.
+
+        Reads the operational trunk table rather than the running-config,
+        because IOS stores the allowed list as ranges ("1-87,89-98") that a
+        substring match on the config would get wrong.
+
+        Specifically parses the "Vlans allowed and active in management domain"
+        section, NOT "Vlans allowed on trunk". The allowed list is by default
+        almost every VLAN (1-4094), so matching against it would report success
+        for a VLAN that does not exist. The active list contains only VLANs
+        that exist AND are permitted on that trunk, which is the real question.
+        """
+        if self.mock_mode:
+            return True
+        out = self._read_quietly("show interfaces trunk")
+        short = port_id.replace("FastEthernet", "Fa").replace("GigabitEthernet", "Gi")
+        in_active_section = False
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Port"):
+                # Section headers restart the table; only one of them is ours.
+                in_active_section = "allowed and active" in line
+                continue
+            if not in_active_section or not line.startswith(short):
+                continue
+            spec = line[len(short):].strip()
+            if not spec or not spec[0].isdigit():
+                continue
+            for part in spec.split(","):
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        lo, hi = (int(x) for x in part.split("-", 1))
+                        if lo <= vlan_id <= hi:
+                            return True
+                    except ValueError:
+                        continue
+                elif part.isdigit() and int(part) == vlan_id:
+                    return True
+        return False
+
+    def _write_then_verify(self, commands: List[str], verify, description: str) -> Dict[str, Any]:
+        """Apply commands, then decide success by reading the device back.
+
+        Returns a dict with:
+          success             -- what the DEVICE shows, not what the write returned
+          verified            -- True when the read-back confirmed the state
+          recovered_from_error-- True when the write raised but the change is live
+        """
+        write_error = None
+        try:
+            self._execute_config_commands(commands)
+        except Exception as e:
+            write_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+
+        confirmed = False
+        try:
+            confirmed = bool(verify())
+        except Exception as e:
+            self.logger.warning(f"Verification of {description} raised: {e}")
+
+        if confirmed:
+            if write_error:
+                self.logger.info(
+                    f"{description}: write reported '{write_error}' but the device "
+                    f"confirms the change is applied — reporting success.")
+            return {"success": True, "verified": True,
+                    "recovered_from_error": bool(write_error),
+                    "write_error": write_error}
+
+        # Not confirmed. If the write also raised, that is a genuine failure.
+        if write_error:
+            raise ConnectionError(f"{description} failed: {write_error}")
+        # Write returned cleanly but the device does not show the change.
+        return {"success": False, "verified": False,
+                "recovered_from_error": False,
+                "write_error": f"{description}: applied without error but the device "
+                               f"does not show the expected state"}
+
     def _execute_config_commands(self, commands: List[str]) -> str:
         """
         Execute multiple configuration commands.
@@ -356,11 +476,15 @@ class CiscoIOSDriver(BaseNetworkDriver):
             f"name {vlan_name}",
             "exit"
         ]
-        
-        output = self._execute_config_commands(commands)
-        
+
+        result = self._write_then_verify(
+            commands,
+            lambda: self.verify_vlan_exists(vlan_id),
+            f"create VLAN {vlan_id}",
+        )
+
         return {
-            "success": True,
+            **result,
             "vlan_id": vlan_id,
             "vlan_name": vlan_name,
             "action": "created",
@@ -423,10 +547,16 @@ class CiscoIOSDriver(BaseNetworkDriver):
         else:
             raise ValueError(f"Invalid mode: {mode}. Must be 'access' or 'trunk'")
         
-        output = self._execute_config_commands(commands)
-        
+        if mode == "access":
+            verify = lambda: self.verify_port_access_vlan(port_id, vlan_id)
+        else:
+            verify = lambda: self.verify_trunk_carries_vlan(port_id, vlan_id)
+
+        result = self._write_then_verify(
+            commands, verify, f"assign VLAN {vlan_id} to {port_id} ({mode})")
+
         return {
-            "success": True,
+            **result,
             "port": port_id,
             "vlan_id": vlan_id,
             "mode": mode,
@@ -461,9 +591,13 @@ class CiscoIOSDriver(BaseNetworkDriver):
             f"switchport trunk allowed vlan add {vlan_id}",
             "no shutdown",
         ]
-        output = self._execute_config_commands(commands)
+        result = self._write_then_verify(
+            commands,
+            lambda: self.verify_trunk_carries_vlan(port_id, vlan_id),
+            f"trunk {port_id} carrying VLAN {vlan_id}",
+        )
         return {
-            "success": True,
+            **result,
             "port": port_id,
             "vlan_added": vlan_id,
             "native_vlan": native_vlan,

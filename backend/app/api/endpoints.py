@@ -1672,22 +1672,26 @@ async def deprovision_network(request: DeprovisionRequest,
                     res = drv.delete_wlan(wid)
                     results["steps_completed"].append(
                         {"step": "delete_wifi_ssid", "device": device["name"], "result": res})
-                    # Also remove the VLAN-only network profile created for this
-                    # segment, so repeated provision/deprovision cycles don't
-                    # leave orphaned UAF-VLAN-<id> networks in the controller.
-                    try:
-                        nres = drv.delete_vlan_network(request.vlan_id)
-                        results["steps_completed"].append(
-                            {"step": "delete_vlan_network", "device": device["name"],
-                             "result": nres})
-                    except Exception as e:
-                        results["steps_failed"].append(
-                            {"step": "delete_vlan_network", "device": device["name"],
-                             "error": str(e)})
                 else:
                     results["steps_failed"].append(
                         {"step": "delete_wifi_ssid", "device": device["name"],
                          "error": f"SSID '{request.ssid}' not found"})
+
+                # Remove the VLAN-only network profile created for this segment.
+                # This runs whether or not the SSID was found or deleted: it used
+                # to be nested inside the SSID-success branch, so any failure
+                # there (the controller intermittently answers a write with 401
+                # while busy) left an orphaned UAF-VLAN-<id> network behind, and
+                # the next provision cycle then had a stale profile to trip over.
+                try:
+                    nres = drv.delete_vlan_network(request.vlan_id)
+                    results["steps_completed"].append(
+                        {"step": "delete_vlan_network", "device": device["name"],
+                         "result": nres})
+                except Exception as e:
+                    results["steps_failed"].append(
+                        {"step": "delete_vlan_network", "device": device["name"],
+                         "error": str(e)})
                 drv.disconnect()
             except Exception as e:
                 results["steps_failed"].append(

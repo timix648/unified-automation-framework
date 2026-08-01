@@ -848,10 +848,40 @@ class UniFiDriver(BaseNetworkDriver):
             data["ap_group_ids"] = [apgroup]
             data["ap_group_mode"] = "all"
         
-        result = self._api_request(endpoint, method="POST", data=data)
-        
+        # WRITE-THEN-VERIFY. The controller intermittently answers a write with
+        # 401 api.err.LoginRequired while it is busy (e.g. provisioning a
+        # freshly adopted AP) even though the SSID is created. Reporting the
+        # write's response as the outcome therefore produces false failures, so
+        # the controller is asked what actually exists before deciding.
+        write_error = None
+        try:
+            self._api_request(endpoint, method="POST", data=data)
+        except Exception as e:
+            write_error = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+
+        if self.mock_mode:
+            created = True  # nothing real to read back
+        else:
+            created = False
+            try:
+                created = any(w.get("name") == ssid for w in self.get_wlan_groups())
+            except Exception as e:
+                self.logger.warning(f"Could not verify SSID '{ssid}': {e}")
+
+        if not created:
+            raise ConnectionError(
+                f"create SSID '{ssid}' failed: {write_error or 'controller does not list the SSID'}")
+
+        if write_error:
+            self.logger.info(
+                f"create SSID '{ssid}': write reported '{write_error}' but the "
+                f"controller lists it — reporting success.")
+
         return {
             "success": True,
+            "verified": True,
+            "recovered_from_error": bool(write_error),
+            "write_error": write_error,
             "ssid": ssid,
             "security": "WPA2",
             "guest_portal": guest_portal,

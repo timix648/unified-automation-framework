@@ -20,10 +20,32 @@ FIXED:
 
 import json
 import os
+import threading
+import time
 from typing import List, Dict, Optional
 from pathlib import Path
 from app.core.config import settings
 from app.inventory import authorized_registry
+
+# --- Device list cache (NetBox API mode only) -------------------------------
+# The dashboard polls the device list every few seconds, but it only changes
+# when somebody edits NetBox. Each uncached read is roughly four sequential
+# HTTP round trips -- the device list, plus an interface lookup per device to
+# resolve MACs for Wake-on-LAN -- which measured 10-22s against this lab's
+# NetBox and made the UI look hung. A short TTL keeps polling cheap while
+# still picking up genuine inventory edits within seconds. Only successful
+# reads are cached, so an outage is never masked by stale data.
+_CACHE_TTL = float(os.getenv("NETBOX_CACHE_SECONDS", "20"))
+_cache_lock = threading.Lock()
+_cached_devices: Optional[List[Dict]] = None
+_cached_at = 0.0
+
+
+def invalidate_device_cache() -> None:
+    """Drop the cached device list; the next read goes back to NetBox."""
+    global _cached_devices
+    with _cache_lock:
+        _cached_devices = None
 
 # We will use the real NetBox API client now, assuming pynetbox is installed
 # If you are still using the JSON file method, we will stick to that for compatibility,
@@ -110,7 +132,16 @@ class NetboxInventory:
 
     def get_all_devices(self) -> List[Dict]:
         """Reads all devices from NetBox (production) or local JSON (mock)."""
+        global _cached_devices, _cached_at
         if self.use_api:
+            if _CACHE_TTL > 0:
+                with _cache_lock:
+                    fresh = (_cached_devices is not None
+                             and (time.time() - _cached_at) < _CACHE_TTL)
+                    if fresh:
+                        self.last_error = None
+                        return list(_cached_devices)
+
             # Production: Fetch from NetBox API
             devices = []
             try:
@@ -149,6 +180,10 @@ class NetboxInventory:
                                 device_data['credentials'] = creds
                         devices.append(device_data)
                 self.last_error = None
+                if _CACHE_TTL > 0:
+                    with _cache_lock:
+                        _cached_devices = list(devices)
+                        _cached_at = time.time()
                 return devices
             except Exception as e:
                 print(f"Error fetching from NetBox API: {e}")

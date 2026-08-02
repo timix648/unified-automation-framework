@@ -298,10 +298,12 @@ class NetworkMonitor:
         """
         
         try:
-            # Fetch device from NetBox
-            nb = NetboxInventory()
-            devices = nb.get_all_devices()
-            
+            # Fetch device from NetBox. The client is synchronous, so it goes to
+            # a thread rather than blocking the event loop for the round trip.
+            devices = await asyncio.to_thread(
+                lambda: NetboxInventory().get_all_devices()
+            )
+
             device = next((d for d in devices if d['name'] == device_name), None)
             
             if not device:

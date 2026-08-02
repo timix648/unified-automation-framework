@@ -13,6 +13,7 @@ ADDITIONS:
 import asyncio
 import os
 import socket
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
@@ -85,8 +86,12 @@ async def ws_events(websocket: WebSocket, token: str = ""):
         """Enqueue a device-status snapshot for THIS client every 10s."""
         while True:
             try:
-                nb = NetboxInventory()
-                devices = nb.get_all_devices()
+                # Inventory reads hit NetBox over HTTP with a blocking client,
+                # so they go to a thread -- this coroutine runs on the event
+                # loop once every 10s for every connected browser tab.
+                devices = await asyncio.to_thread(
+                    lambda: NetboxInventory().get_all_devices()
+                )
 
                 async def probe(d):
                     host = d.get("ip") or d.get("primary_ip", "")
@@ -284,10 +289,19 @@ class WlanUpdateRequest(BaseModel):
 # ============================================================================
 # DEVICE MANAGEMENT ENDPOINTS
 # ============================================================================
+#
+# These handlers are deliberately declared `def`, not `async def`. Every one of
+# them talks to hardware -- SSH to Cisco, the RouterOS API, the UniFi REST API,
+# NetBox -- through synchronous libraries. Declared `async`, that blocking I/O
+# runs on the event loop and stalls the whole process: a single NetBox lookup is
+# ~4 sequential HTTP round trips, and one provisioning run is minutes of SSH.
+# While the loop is parked, nothing else is served, so the dashboard's own
+# polls time out and it renders "0 managed devices" against a healthy network.
+# Declared `def`, FastAPI runs them in its threadpool and the loop stays free.
 
 
 @router.get("/devices")
-async def get_all_devices(current_user: dict = Depends(get_current_user)):
+def get_all_devices(current_user: dict = Depends(get_current_user)):
     """Fetch all network devices from NetBox inventory."""
     try:
         nb = NetboxInventory()
@@ -311,9 +325,11 @@ async def get_devices_health(current_user: dict = Depends(get_current_user)):
     online/offline status for the *registered* devices without the user
     having to inspect each one. This is a reachability check (TCP), not a
     network discovery scan — it reports on known inventory only.
+
+    Stays async because the probes genuinely run concurrently; only the
+    blocking inventory fetch is pushed to a thread.
     """
-    nb = NetboxInventory()
-    devices = nb.get_all_devices()
+    devices = await asyncio.to_thread(lambda: NetboxInventory().get_all_devices())
 
     async def probe(device: dict):
         host = device.get("ip") or device.get("primary_ip", "")
@@ -338,7 +354,7 @@ async def get_devices_health(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/devices/{device_name}")
-async def get_device_details(device_name: str, current_user: dict = Depends(get_current_user)):
+def get_device_details(device_name: str, current_user: dict = Depends(get_current_user)):
     """Get detailed information about a specific device."""
     try:
         nb = NetboxInventory()
@@ -354,7 +370,7 @@ async def get_device_details(device_name: str, current_user: dict = Depends(get_
 
 
 @router.get("/devices/{device_name}/interfaces")
-async def get_device_interfaces(device_name: str, current_user: dict = Depends(get_current_user)):
+def get_device_interfaces(device_name: str, current_user: dict = Depends(get_current_user)):
     """Get all interfaces for a specific device.
 
     GRACEFUL OFFLINE HANDLING: if the device is not reachable (not yet
@@ -399,7 +415,7 @@ async def get_device_interfaces(device_name: str, current_user: dict = Depends(g
 
 
 @router.get("/devices/{device_name}/wlans")
-async def get_device_wlans(device_name: str,
+def get_device_wlans(device_name: str,
                            current_user: dict = Depends(get_current_user)):
     """List the wireless networks (SSIDs) configured on a UniFi controller.
 
@@ -444,7 +460,7 @@ def _resolve_unifi_device(device_name: str) -> dict:
 
 
 @router.put("/devices/{device_name}/wlans/{wlan_id}")
-async def update_device_wlan(device_name: str, wlan_id: str,
+def update_device_wlan(device_name: str, wlan_id: str,
                              request: WlanUpdateRequest,
                              current_user: dict = Depends(require_operator)):
     """Edit an existing SSID's settings (name, password, VLAN, security, enabled)
@@ -469,7 +485,7 @@ async def update_device_wlan(device_name: str, wlan_id: str,
 
 
 @router.delete("/devices/{device_name}/wlans/{wlan_id}")
-async def delete_device_wlan(device_name: str, wlan_id: str,
+def delete_device_wlan(device_name: str, wlan_id: str,
                              current_user: dict = Depends(require_admin)):
     """Remove an SSID from the UniFi controller entirely. Admin-only (destructive)."""
     device = _resolve_unifi_device(device_name)
@@ -488,7 +504,7 @@ async def delete_device_wlan(device_name: str, wlan_id: str,
 
 
 @router.post("/devices/port-control")
-async def control_port(request: PortControlRequest, current_user: dict = Depends(require_operator)):
+def control_port(request: PortControlRequest, current_user: dict = Depends(require_operator)):
     """Enable or disable a specific port on a device (manual Kill-Switch)."""
     try:
         nb = NetboxInventory()
@@ -543,7 +559,7 @@ async def control_port(request: PortControlRequest, current_user: dict = Depends
 
 
 @router.post("/security/alert")
-async def trigger_security_response(
+def trigger_security_response(
     request: SecurityAlertRequest, background_tasks: BackgroundTasks,
     current_user: dict = Depends(require_operator)
 ):
@@ -582,7 +598,7 @@ async def trigger_security_response(
 
 
 @router.get("/security/threats")
-async def get_active_threats(current_user: dict = Depends(get_current_user)):
+def get_active_threats(current_user: dict = Depends(get_current_user)):
     """Retrieve a list of currently detected threats.
 
     Flattens the nested mac_address up to a top-level 'mac' field so the
@@ -620,7 +636,7 @@ async def get_active_threats(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/security/stats")
-async def get_security_statistics(current_user: dict = Depends(get_current_user)):
+def get_security_statistics(current_user: dict = Depends(get_current_user)):
     """Get aggregated security threat statistics."""
     try:
         kill_switch = KillSwitchService()
@@ -639,7 +655,7 @@ async def trigger_security_scan(background_tasks: BackgroundTasks, current_user:
 
 
 @router.post("/security/restore")
-async def restore_port(request: PortRestoreRequest, current_user: dict = Depends(require_operator)):
+def restore_port(request: PortRestoreRequest, current_user: dict = Depends(require_operator)):
     """Re-enable a previously shut-down port after threat is cleared."""
     try:
         kill_switch = KillSwitchService()
@@ -745,7 +761,7 @@ async def trust_discovered_device(request: AuthorizedDeviceRequest,
 
 
 @router.post("/security/clear-threats")
-async def clear_threats(current_user: dict = Depends(require_operator)):
+def clear_threats(current_user: dict = Depends(require_operator)):
     """Clear the resolved-threat log. Used after trusting devices so the
     threat list reflects only currently-detected rogues on the next scan."""
     try:
@@ -920,7 +936,7 @@ async def get_scheduler_status(current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/power/wake")
-async def wake_device(request: WoLRequest, current_user: dict = Depends(require_operator)):
+def wake_device(request: WoLRequest, current_user: dict = Depends(require_operator)):
     """Send a Wake-on-LAN magic packet to power on a device."""
     try:
         send_magic_packet(request.mac_address, request.broadcast_ip)
@@ -938,7 +954,7 @@ async def wake_device(request: WoLRequest, current_user: dict = Depends(require_
 
 
 @router.post("/power/wake-batch")
-async def wake_devices_batch(request: WoLBatchRequest,
+def wake_devices_batch(request: WoLBatchRequest,
                              current_user: dict = Depends(require_operator)):
     """Send Wake-on-LAN magic packets to multiple devices at once."""
     results = []
@@ -991,7 +1007,7 @@ def _subnet_broadcast(ip: str) -> str:
 
 
 @router.get("/power/discovered-hosts")
-async def discovered_hosts(current_user: dict = Depends(get_current_user)):
+def discovered_hosts(current_user: dict = Depends(get_current_user)):
     """List hosts seen on the network (from switch MAC address tables) as
     Wake-on-LAN candidates. This surfaces real end-hosts — laptops, PCs — not
     just the managed vendor devices, so any machine the network has seen can be
@@ -1025,7 +1041,7 @@ async def discovered_hosts(current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/power/wake-segment")
-async def wake_segment(request: WoLSegmentRequest,
+def wake_segment(request: WoLSegmentRequest,
                        current_user: dict = Depends(require_operator)):
     """Wake every WoL-enabled host on a switch's segment via subnet broadcast.
     Selecting the switch floods a magic packet across its network so all hosts
@@ -1125,12 +1141,14 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
     """
     _paused_jobs = pause_device_jobs("network provisioning")
     try:
-        return await _provision_network_impl(request, current_user)
+        # Minutes of blocking SSH -- off the event loop, or the API is dead for
+        # the whole run and the operator watching the dashboard sees nothing.
+        return await asyncio.to_thread(_provision_network_impl, request, current_user)
     finally:
         resume_device_jobs(_paused_jobs)
 
 
-async def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict):
+def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict):
     """The provisioning work itself; see provision_network for the wrapper."""
     results = {
         "network_name": request.network_name,
@@ -1252,7 +1270,7 @@ async def _provision_network_impl(request: NetworkProvisionRequest, current_user
                     except Exception as ce:
                         _last_err = ce
                         if _attempt < 2:
-                            await asyncio.sleep(8)
+                            time.sleep(8)
                 if _last_err is not None:
                     raise _last_err
 
@@ -1518,7 +1536,7 @@ async def _provision_network_impl(request: NetworkProvisionRequest, current_user
 
 
 @router.get("/audit/logs")
-async def get_audit_logs(limit: int = 100, current_user: dict = Depends(require_admin)):
+def get_audit_logs(limit: int = 100, current_user: dict = Depends(require_admin)):
     """Retrieve recent audit log entries for security review."""
     try:
         logs = audit_logger.get_recent_logs(limit=limit)
@@ -1665,7 +1683,7 @@ async def reset_user_password(username: str, request: ResetPasswordRequest,
 
 
 @router.get("/provision/segments")
-async def list_segments(current_user: dict = Depends(get_current_user)):
+def list_segments(current_user: dict = Depends(get_current_user)):
     """Read current network segments from the live devices so the admin can see
     what exists before choosing one to remove. Reads VLANs (Cisco), DHCP leases/
     pools (MikroTik) and WLANs (UniFi). Read-only — never modifies anything."""
@@ -1703,12 +1721,12 @@ async def deprovision_network(request: DeprovisionRequest,
     """
     _paused_jobs = pause_device_jobs("network de-provisioning")
     try:
-        return await _deprovision_network_impl(request, current_user)
+        return await asyncio.to_thread(_deprovision_network_impl, request, current_user)
     finally:
         resume_device_jobs(_paused_jobs)
 
 
-async def _deprovision_network_impl(request: DeprovisionRequest, current_user: dict):
+def _deprovision_network_impl(request: DeprovisionRequest, current_user: dict):
     """The de-provisioning work itself; see deprovision_network for the wrapper."""
     results = {
         "network_name": request.network_name,

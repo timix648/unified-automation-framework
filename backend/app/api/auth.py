@@ -51,10 +51,14 @@ class UserResponse(BaseModel):
 # ============================================================================
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+def login(request: LoginRequest):
     """
     Authenticate a user and return a JWT access token.
-    
+
+    Sync `def` on purpose: bcrypt verification is deliberately slow and CPU
+    bound, so on the event loop it would stall every other request for the
+    duration of each login. FastAPI runs sync handlers in its threadpool.
+
     Default credentials:
     - Admin: username=admin, password=admin123
     - Operator: username=operator, password=operator123
@@ -74,7 +78,7 @@ async def login(request: LoginRequest):
         raise e
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+def get_current_user_info(current_user: dict = Depends(get_current_user)):
     """
     Get information about the currently authenticated user.
     Requires a valid JWT token in the Authorization header.
@@ -86,7 +90,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     }
 
 @router.post("/change-password")
-async def change_password(
+def change_password(
     request: ChangePasswordRequest,
     current_user: dict = Depends(get_current_user),
 ):
@@ -115,7 +119,7 @@ async def change_password(
 
 
 @router.post("/logout")
-async def logout(current_user: dict = Depends(get_current_user)):
+def logout(current_user: dict = Depends(get_current_user)):
     """
     Logout endpoint (JWT tokens are stateless, so this is mostly for logging).
     In a production system, you might want to add the token to a blacklist.
@@ -137,7 +141,7 @@ async def logout(current_user: dict = Depends(get_current_user)):
 require_admin = RoleChecker(["admin"])
 
 @router.post("/users", response_model=UserResponse)
-async def create_user(
+def create_user(
     request: UserCreateRequest,
     current_user: dict = Depends(require_admin)
 ):
@@ -166,7 +170,7 @@ async def create_user(
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.get("/users")
-async def list_users(current_user: dict = Depends(require_admin)):
+def list_users(current_user: dict = Depends(require_admin)):
     """
     List all users (Admin only).
     """
@@ -189,7 +193,7 @@ async def list_users(current_user: dict = Depends(require_admin)):
 # ============================================================================
 
 @router.get("/validate")
-async def validate_token(current_user: dict = Depends(get_current_user)):
+def validate_token(current_user: dict = Depends(get_current_user)):
     """
     Validate a JWT token and return basic user info.
     Useful for frontend token validation.

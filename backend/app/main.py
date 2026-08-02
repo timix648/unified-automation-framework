@@ -41,6 +41,16 @@ ENABLE_SNMP_TRAPS = os.getenv("ENABLE_SNMP_TRAPS", "false").lower() == "true"
 from app.services.kill_switch import KillSwitchService
 from app.services.device_manager import DeviceFactory
 
+# Uvicorn configures only its own loggers, so nothing the application logs was
+# reaching the console -- including the driver warnings that explain WHY a
+# provisioning step failed. Without this, a failed run is undiagnosable after
+# the fact. LOG_LEVEL is env-tunable; INFO is the useful default.
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
 logger = logging.getLogger(__name__)
 
 # ============================================================================

@@ -142,14 +142,38 @@ class MikroTikDriver(BaseNetworkDriver):
         except Exception as e:
             self.logger.error(f"Disconnect error: {str(e)}")
             return False
+        finally:
+            # Drop the handle either way. Without this a second disconnect --
+            # or a reconnect attempt -- operates on an already-closed pool,
+            # which is what raises WinError 10038.
+            self.connection = None
     
     def _get_api(self):
-        """Get API connection object."""
+        """Get API connection object, reconnecting if the socket has died.
+
+        RouterOS drops the API socket under load. The library does not notice:
+        the pool object still looks valid, so the next call fails with
+        "[WinError 10038] An operation was attempted on something that is not
+        a socket" or a bare timeout, and the step is reported as failed even
+        though nothing was wrong with the request. Re-establishing the session
+        once turns that into a normal retry.
+        """
         if self.mock_mode:
             return None
         if not self.connection:
             raise ConnectionError("Not connected to MikroTik device")
-        return self.connection.get_api()
+        try:
+            return self.connection.get_api()
+        except Exception as e:
+            self.logger.warning(f"MikroTik API socket unusable ({e}); reconnecting once")
+            try:
+                self.disconnect()
+            except Exception:
+                pass
+            self.connect()
+            if not self.connection:
+                raise ConnectionError("MikroTik reconnect failed")
+            return self.connection.get_api()
     
     # =========================================================================
     # INTERFACE MANAGEMENT

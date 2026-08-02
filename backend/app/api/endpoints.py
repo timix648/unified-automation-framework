@@ -18,7 +18,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.security import decode_access_token
 from app.services.event_bus import event_bus
@@ -1127,6 +1127,12 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
     devices = nb.get_all_devices()
 
     # ---- Step 1: Create VLAN on Cisco switches ----
+    # The session opened here is HELD and reused for the trunking phase (Step 4)
+    # rather than reconnecting. This switch reliably grants about one SSH
+    # session at a time; opening a second one for trunking regularly failed with
+    # "No existing session" and lost the whole uplink phase. Steps 2 and 3 take
+    # well under the vty idle timeout, so the held session survives them.
+    cisco_sessions: Dict[str, Any] = {}
     cisco_devices = [d for d in devices if "cisco" in d.get("platform", "").lower()]
     for device in cisco_devices:
         try:
@@ -1193,13 +1199,16 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                             "error": str(e)
                         })
 
-            _commit_and_close(driver)   # single deferred save for the whole block
+            # Keep the session open for Step 4 instead of closing it here. The
+            # deferred save still happens once, at the end of trunking.
+            cisco_sessions[device["name"]] = driver
 
         except Exception as e:
             # Persist whatever did apply before the failure, so a partial run
             # is not silently lost on the next reload -- but never let the save
             # stop the session being closed.
             _commit_and_close(driver)
+            cisco_sessions.pop(device["name"], None)
             results["steps_failed"].append({
                 "step": "cisco_setup",
                 "device": device["name"],
@@ -1356,9 +1365,14 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
     if request.stitch_data_path:
         for device in [d for d in devices if "cisco" in d.get("platform", "").lower()]:
             try:
-                driver = DeviceFactory.get_driver(device)
-                driver.defer_save = True   # one flash write for both trunks
-                driver.connect()
+                # Reuse the session Step 1 left open. Only reconnect if that
+                # phase failed or never ran -- opening a second concurrent
+                # session is what this switch refuses.
+                driver = cisco_sessions.get(device["name"])
+                if driver is None:
+                    driver = DeviceFactory.get_driver(device)
+                    driver.defer_save = True   # one flash write for both trunks
+                    driver.connect()
 
                 # DISCOVER the uplinks rather than trusting hardcoded ports.
                 # For each non-Cisco managed device, look its MAC up in the
@@ -1414,13 +1428,22 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                             "error": str(e)
                         })
                 _commit_and_close(driver)
+                cisco_sessions.pop(device["name"], None)
             except Exception as e:
                 _commit_and_close(driver)
+                cisco_sessions.pop(device["name"], None)
                 results["steps_failed"].append({
                     "step": "trunk_uplinks",
                     "device": device["name"],
                     "error": str(e)
                 })
+
+    # Close any session Step 1 held that Step 4 did not consume -- when
+    # stitch_data_path is off, or a device was skipped. Without this the held
+    # session leaks and the switch refuses the next run.
+    for _name, _drv in list(cisco_sessions.items()):
+        _commit_and_close(_drv)
+        cisco_sessions.pop(_name, None)
 
     # Log the provisioning action
     audit_logger.log_security_event(

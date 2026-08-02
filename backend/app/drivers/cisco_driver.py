@@ -408,6 +408,24 @@ class CiscoIOSDriver(BaseNetworkDriver):
             f"{description} failed: {write_error} (and the device could not be "
             f"read back to confirm)")
 
+    def _resync_channel(self) -> None:
+        """Return the session to a known enable prompt after a prompt-check failure.
+
+        A failed config_mode()/exit_config_mode() can leave the session sitting
+        in config mode with unread output, so every later command fails too.
+        Writing 'end' on the raw channel and re-reading the prompt costs a
+        couple of seconds and restores it. Raw writes are used deliberately:
+        the netmiko helpers are the thing that just failed.
+        """
+        if not self.connection:
+            return
+        try:
+            self.connection.write_channel("end\n")
+            time.sleep(2)
+            self.connection.find_prompt()
+        except Exception as e:
+            self.logger.warning(f"Channel re-sync failed: {e}")
+
     def _execute_config_commands(self, commands: List[str]) -> str:
         """
         Execute multiple configuration commands.
@@ -434,18 +452,33 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # 'Pattern not detected' and the change is reported as failed even
             # though it often applied. cmd_verify=False stops Netmiko from
             # waiting to echo each command back (another slow-switch stall).
-            output = self.connection.send_config_set(
-                commands,
-                # Env-tunable: on a LAN 60s is ample, but when the switch is
-                # reached across a WAN/VPN every prompt round-trip costs the
-                # link RTT (~340ms measured Lagos->Azure), so a multi-command
-                # config set can exceed it and fail with 'Pattern not detected'
-                # even though the commands applied. Raise CISCO_READ_TIMEOUT
-                # for remote deployments rather than editing code.
+            # Env-tunable: on a LAN 60s is ample, but when the switch is
+            # reached across a WAN/VPN every prompt round-trip costs the
+            # link RTT (~340ms measured Lagos->Azure), so a multi-command
+            # config set can exceed it and fail with 'Pattern not detected'
+            # even though the commands applied. Raise CISCO_READ_TIMEOUT
+            # for remote deployments rather than editing code.
+            send_kwargs = dict(
                 read_timeout=int(os.getenv('CISCO_READ_TIMEOUT', '60')),
                 delay_factor=2,
                 cmd_verify=False,
             )
+            try:
+                output = self.connection.send_config_set(commands, **send_kwargs)
+            except Exception as first_error:
+                # cmd_verify=False silences the per-command echo check, but NOT
+                # netmiko's own config_mode()/exit_config_mode() prompt checks.
+                # Those are what raise "Pattern not detected: 'configure
+                # terminal'" and "...'end'" on this switch when it stops
+                # echoing -- while the commands themselves apply. Re-sync the
+                # channel and retry once. Every config set built here is
+                # idempotent (vlan N / name X / switchport access vlan N), so a
+                # repeat is harmless, and the caller verifies against the
+                # device afterwards regardless.
+                self.logger.warning(
+                    f"Config set failed ({first_error}); re-syncing channel and retrying once")
+                self._resync_channel()
+                output = self.connection.send_config_set(commands, **send_kwargs)
             
             # Persist. On a 2960 'write memory' is a flash write costing
             # 5-15s AND spiking CPU, which is what makes the NEXT step's

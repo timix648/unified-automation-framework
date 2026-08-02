@@ -10,6 +10,7 @@ import urllib3
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import json
+import os
 import time
 
 from .base_driver import BaseNetworkDriver
@@ -77,9 +78,33 @@ class UniFiDriver(BaseNetworkDriver):
         self.session = requests.Session()
 
         # --- Attempt 1: legacy style (classic Network Application) ---
+        #
+        # Retried, and with a timeout that reflects a BUSY controller rather
+        # than an idle one. At 10s a controller that was mid-provision simply
+        # did not answer in time; the request raised, control fell through to
+        # the UniFi OS endpoint below, and THAT returned "401
+        # api.err.LoginRequired" because it does not exist on a classic
+        # controller. The reported failure was therefore an authentication
+        # error for what was really a timeout -- credentials were never the
+        # problem. Falling through to a wrong endpoint must not be the response
+        # to a slow reply.
+        login_timeout = float(os.getenv("UNIFI_LOGIN_TIMEOUT", "30"))
+        legacy_error = None
+        for attempt in range(3):
+            try:
+                r = self.session.post(f"{self.base_url}/api/login", json=creds,
+                                      verify=False, timeout=login_timeout)
+                legacy_error = None
+                break
+            except Exception as e:
+                legacy_error = e
+                self.logger.warning(
+                    f"UniFi legacy login attempt {attempt+1} failed ({type(e).__name__}); "
+                    f"retrying")
+                time.sleep(2 * (attempt + 1))
         try:
-            r = self.session.post(f"{self.base_url}/api/login", json=creds,
-                                  verify=False, timeout=10)
+            if legacy_error is not None:
+                raise legacy_error
             if r.status_code == 200:
                 self.is_unifios = False
                 self.cookies = r.cookies

@@ -442,6 +442,22 @@ class CiscoIOSDriver(BaseNetworkDriver):
             f"{description} failed: {write_error} (and the device could not be "
             f"read back to confirm)")
 
+    def _enter_config_mode(self) -> None:
+        """Enter config mode with a raw 'configure terminal', no prompt check.
+
+        Counterpart to _leave_config_mode: netmiko's config_mode() verifies the
+        '(config)#' prompt with its own timeout, and that confirmation is what
+        stalls on this switch -- the command itself always takes.
+        """
+        if not self.connection:
+            return
+        try:
+            self.connection.write_channel("configure terminal\n")
+            time.sleep(0.6)
+            self.connection.clear_buffer()
+        except Exception as e:
+            self.logger.warning(f"Entering config mode raised: {e}")
+
     def _leave_config_mode(self) -> None:
         """Drop out of config mode with a raw 'end', no prompt matching.
 
@@ -540,13 +556,16 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 read_timeout=int(os.getenv('CISCO_READ_TIMEOUT', '60')),
                 delay_factor=2,
                 cmd_verify=False,
-                # Leave config mode ourselves, below. Netmiko's own
-                # exit_config_mode() does a prompt check with its OWN timeout
-                # that ignores read_timeout -- measured at 30s while
-                # CISCO_READ_TIMEOUT was 10s -- and it is the single biggest
-                # remaining source of dead time. Every manual recovery tonight
-                # that used exit_config_mode=False plus a raw 'end' succeeded
-                # where netmiko's path timed out.
+                # Both config-mode transitions are done by us, not netmiko.
+                # config_mode() and exit_config_mode() each verify the prompt
+                # using their OWN timeout, which ignores read_timeout -- 30s
+                # observed while CISCO_READ_TIMEOUT was 10s -- and between them
+                # they were the largest remaining source of dead time. Entering
+                # and leaving config mode are single unambiguous keystrokes
+                # that IOS always honours; it is only the confirmation that is
+                # unreliable on this switch. Every manual recovery tonight took
+                # this approach and succeeded where netmiko's path timed out.
+                enter_config_mode=False,
                 exit_config_mode=False,
             )
             # Timed so a slow provision can be attributed to a specific step
@@ -554,6 +573,7 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # total, which says nothing about where the seconds went.
             _t0 = time.time()
             try:
+                self._enter_config_mode()
                 output = self.connection.send_config_set(commands, **send_kwargs)
                 self._leave_config_mode()
                 self.logger.info(

@@ -950,6 +950,29 @@ async def wake_devices_batch(request: WoLBatchRequest,
     return {"status": "success", "sent": sent, "total": len(request.macs), "results": results}
 
 
+def _commit_and_close(driver) -> None:
+    """Save deferred config, then ALWAYS close the session.
+
+    A leaked SSH session is not a tidiness issue on a Catalyst 2960: it holds
+    one of the few vty lines until the idle timeout expires, so a run that
+    leaks makes the next run more likely to fail, which leaks another. The
+    save is the step most likely to time out on this switch, so it must never
+    be able to prevent the disconnect -- hence the separate try blocks and the
+    finally. Both failures are swallowed deliberately: the caller is already
+    reporting the real error, and neither cleanup step should mask it.
+    """
+    try:
+        try:
+            driver.commit()
+        except Exception:
+            pass
+    finally:
+        try:
+            driver.disconnect()
+        except Exception:
+            pass
+
+
 def _subnet_broadcast(ip: str) -> str:
     """Best-effort /24 subnet broadcast for an IPv4 address (x.y.z.255).
     Falls back to the global broadcast if the IP cannot be parsed."""
@@ -1170,17 +1193,13 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                             "error": str(e)
                         })
 
-            driver.commit()   # single deferred save for the whole block
-            driver.disconnect()
+            _commit_and_close(driver)   # single deferred save for the whole block
 
         except Exception as e:
             # Persist whatever did apply before the failure, so a partial run
-            # is not silently lost on the next reload.
-            try:
-                driver.commit()
-                driver.disconnect()
-            except Exception:
-                pass
+            # is not silently lost on the next reload -- but never let the save
+            # stop the session being closed.
+            _commit_and_close(driver)
             results["steps_failed"].append({
                 "step": "cisco_setup",
                 "device": device["name"],
@@ -1266,6 +1285,12 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                 driver.disconnect()
 
             except Exception as e:
+                # Close the session on the error path too, or a failed run
+                # leaves it held open.
+                try:
+                    driver.disconnect()
+                except Exception:
+                    pass
                 results["steps_failed"].append({
                     "step": "create_dhcp_pool",
                     "device": device["name"],
@@ -1309,6 +1334,10 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                 driver.disconnect()
 
             except Exception as e:
+                try:
+                    driver.disconnect()
+                except Exception:
+                    pass
                 results["steps_failed"].append({
                     "step": "create_wifi_ssid",
                     "device": device["name"],
@@ -1384,14 +1413,9 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
                             "port": up_port,
                             "error": str(e)
                         })
-                driver.commit()
-                driver.disconnect()
+                _commit_and_close(driver)
             except Exception as e:
-                try:
-                    driver.commit()
-                    driver.disconnect()
-                except Exception:
-                    pass
+                _commit_and_close(driver)
                 results["steps_failed"].append({
                     "step": "trunk_uplinks",
                     "device": device["name"],
@@ -1649,6 +1673,10 @@ async def deprovision_network(request: DeprovisionRequest,
                          "port": up_port, "error": str(e)})
             drv.disconnect()
         except Exception as e:
+            try:
+                drv.disconnect()
+            except Exception:
+                pass
             results["steps_failed"].append(
                 {"step": "delete_vlan", "device": device["name"], "error": str(e)})
 
@@ -1683,6 +1711,10 @@ async def deprovision_network(request: DeprovisionRequest,
                     {"step": "delete_vlan_gateway", "device": device["name"], "error": str(e)})
             drv.disconnect()
         except Exception as e:
+            try:
+                drv.disconnect()
+            except Exception:
+                pass
             results["steps_failed"].append(
                 {"step": "mikrotik_deprovision", "device": device["name"], "error": str(e)})
 
@@ -1723,6 +1755,10 @@ async def deprovision_network(request: DeprovisionRequest,
                          "error": str(e)})
                 drv.disconnect()
             except Exception as e:
+                try:
+                    drv.disconnect()
+                except Exception:
+                    pass
                 results["steps_failed"].append(
                     {"step": "delete_wifi_ssid", "device": device["name"], "error": str(e)})
 

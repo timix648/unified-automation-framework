@@ -78,13 +78,16 @@ class CiscoIOSDriver(BaseNetworkDriver):
         """
         if self.mock_mode or not self._unsaved_changes:
             return True
+        _ts = time.time()
         try:
             self.connection.save_config()
             self._unsaved_changes = False
-            self.logger.info("Configuration saved to flash")
+            self.logger.info(f"[TIMING] flash save took {time.time()-_ts:.1f}s")
             return True
         except Exception as e:
-            self.logger.warning(f"Deferred save failed (config is live but unsaved): {e}")
+            self.logger.warning(
+                f"[TIMING] flash save failed after {time.time()-_ts:.1f}s "
+                f"(config is live but unsaved): {e}")
             return False
         
     def connect(self) -> bool:
@@ -134,13 +137,20 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # with another. Retry the connect a few times so a momentary
             # "TCP connection failed" doesn't abort a kill-switch.
             last_err = None
+            _tc = time.time()
             for attempt in range(3):
                 try:
                     self.connection = ConnectHandler(**device_params)
                     last_err = None
+                    self.logger.info(
+                        f"[TIMING] SSH connect took {time.time()-_tc:.1f}s "
+                        f"(attempt {attempt+1})")
                     break
                 except Exception as e:
                     last_err = e
+                    self.logger.warning(
+                        f"[TIMING] SSH connect attempt {attempt+1} failed after "
+                        f"{time.time()-_tc:.1f}s: {type(e).__name__}")
                     time.sleep(2 * (attempt + 1))  # 2s, then 4s, then 6s
             if last_err is not None:
                 raise last_err
@@ -468,14 +478,18 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # three such failures is ~270s of pure waiting. Re-sync first, and
             # retry the check once, so a stale prompt cannot fail the step or
             # burn the timeout.
+            _te = time.time()
             try:
                 if not self.connection.check_enable_mode():
                     self.connection.enable()
             except Exception as e:
-                self.logger.warning(f"Enable-mode check failed ({e}); re-syncing and retrying")
+                self.logger.warning(
+                    f"Enable-mode check failed after {time.time()-_te:.1f}s ({e}); "
+                    f"re-syncing and retrying")
                 self._resync_channel()
                 if not self.connection.check_enable_mode():
                     self.connection.enable()
+            self.logger.info(f"[TIMING] enable-mode check took {time.time()-_te:.1f}s")
                 
             # Slow legacy switches (e.g. 2960) can be sluggish returning the
             # config prompt; without a generous read_timeout Netmiko raises
@@ -493,8 +507,14 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 delay_factor=2,
                 cmd_verify=False,
             )
+            # Timed so a slow provision can be attributed to a specific step
+            # instead of guessed at. Without this the only visible number is the
+            # total, which says nothing about where the seconds went.
+            _t0 = time.time()
             try:
                 output = self.connection.send_config_set(commands, **send_kwargs)
+                self.logger.info(
+                    f"[TIMING] config set ({commands[0][:34]}) took {time.time()-_t0:.1f}s")
             except Exception as first_error:
                 # cmd_verify=False silences the per-command echo check, but NOT
                 # netmiko's own config_mode()/exit_config_mode() prompt checks.

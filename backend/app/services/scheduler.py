@@ -375,15 +375,22 @@ def start_scheduler():
         logger.warning("[SCHEDULER] Already running, skipping start.")
         return
 
-    # Job 1: Check Time-Based Access every 60 minutes
-    scheduler.add_job(
-        auto_enforce_time_policy,
-        'interval',
-        minutes=TIME_POLICY_INTERVAL_MINUTES,
-        id='time_policy',
-        replace_existing=True,
-        name='Time-Based Access Policy'
-    )
+    # Job 1: Check Time-Based Access. As with the scan below, 0 disables it.
+    # APScheduler treats an interval of 0 as "run continuously" rather than
+    # "never", so the guard is required -- without it, setting 0 to quieten the
+    # job does the opposite and hammers the switch.
+    if TIME_POLICY_INTERVAL_MINUTES > 0:
+        scheduler.add_job(
+            auto_enforce_time_policy,
+            'interval',
+            minutes=TIME_POLICY_INTERVAL_MINUTES,
+            id='time_policy',
+            replace_existing=True,
+            name='Time-Based Access Policy'
+        )
+    else:
+        logger.warning("[SYSTEM] Time-based access policy DISABLED "
+                       "(TIME_POLICY_INTERVAL_MINUTES=0).")
 
     # Job 2: Scan for Security Threats. Setting the interval to 0 disables the
     # periodic scan (manual scans via /api/security/scan still work), which

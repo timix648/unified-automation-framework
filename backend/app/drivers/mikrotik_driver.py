@@ -504,9 +504,41 @@ class MikroTikDriver(BaseNetworkDriver):
             }
             
         except Exception as e:
+            # A timeout here usually means the request WAS applied and only the
+            # reply was lost. Left unchecked that raises, the caller marks the
+            # step failed, and -- the damage that matters -- the rest of the
+            # MikroTik chain is skipped, so the VLAN gateway and DHCP server
+            # are never even attempted. Observed exactly that: the pool existed
+            # on the router while the segment had no gateway.
+            #
+            # Confirming is cheap here in a way it is NOT on the Cisco: this is
+            # a binary API read costing milliseconds, not a terminal round-trip
+            # on a switch that buckles under them.
+            self.logger.warning(f"DHCP pool write failed ({e}); checking whether it applied")
+            try:
+                api = self._get_api()   # reconnects if the socket died
+                pool_ok = any(p.get("name") == f"{pool_name}-pool"
+                              for p in api.get_resource('/ip/pool').get())
+                net_ok = any(n.get("address") == network
+                             for n in api.get_resource('/ip/dhcp-server/network').get())
+                if pool_ok and net_ok:
+                    self.logger.warning(
+                        f"DHCP pool '{pool_name}-pool' and network {network} are present "
+                        f"on the device — treating as applied")
+                    return {
+                        "success": True,
+                        "pool_name": pool_name,
+                        "network": network,
+                        "gateway": gateway,
+                        "dns_servers": dns_servers,
+                        "recovered_from_error": str(e).strip().splitlines()[0] or type(e).__name__,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+            except Exception as check_error:
+                self.logger.error(f"Could not confirm DHCP pool state: {check_error}")
             self.logger.error(f"Failed to create DHCP pool: {str(e)}")
             raise
-    
+
     def delete_dhcp_network(self, pool_name: str, network: str) -> Dict[str, Any]:
         """Remove the DHCP pool and DHCP-server network created by provisioning.
 

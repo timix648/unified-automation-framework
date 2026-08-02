@@ -349,7 +349,22 @@ class CiscoIOSDriver(BaseNetworkDriver):
           success             -- what the DEVICE shows, not what the write returned
           verified            -- True when the read-back confirmed the state
           recovered_from_error-- True when the write raised but the change is live
+
+        Verification is OFF by default (CISCO_VERIFY_WRITES=false).
+        Read-back roughly doubles the terminal operations per provision, and
+        prompt-matched reads are the operation this 2960 handles worst -- on
+        this hardware the checking measurably contributed to the switch's
+        management plane collapsing, which is a far worse failure than the
+        mis-reporting it was added to fix. Set CISCO_VERIFY_WRITES=true on
+        healthier equipment, where honest per-step reporting is worth the
+        extra reads.
         """
+        if os.getenv("CISCO_VERIFY_WRITES", "false").lower() not in ("1", "true", "yes"):
+            # Original behaviour: the write either raises or it succeeded.
+            self._execute_config_commands(commands)
+            return {"success": True, "verified": False, "unverified": True,
+                    "recovered_from_error": False}
+
         write_error = None
         try:
             self._execute_config_commands(commands)

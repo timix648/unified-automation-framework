@@ -47,6 +47,25 @@ def invalidate_device_cache() -> None:
     with _cache_lock:
         _cached_devices = None
 
+
+# pynetbox sets no request timeout, so a NetBox that accepts the connection but
+# never answers -- seen when its container wedged at 248% CPU -- hangs every
+# inventory read until the OS gives up. Bounding it turns an indefinite hang
+# into a normal failure that last_error can report.
+NETBOX_TIMEOUT = float(os.getenv("NETBOX_TIMEOUT", "10"))
+
+
+def _timeout_session():
+    """A requests Session that applies NETBOX_TIMEOUT to every call."""
+    import requests
+
+    class _TimeoutSession(requests.Session):
+        def request(self, *args, **kwargs):
+            kwargs.setdefault("timeout", NETBOX_TIMEOUT)
+            return super().request(*args, **kwargs)
+
+    return _TimeoutSession()
+
 # We will use the real NetBox API client now, assuming pynetbox is installed
 # If you are still using the JSON file method, we will stick to that for compatibility,
 # but add the "get_trusted_macs" method.
@@ -117,6 +136,7 @@ class NetboxInventory:
                     settings.NETBOX_URL,
                     token=settings.NETBOX_TOKEN
                 )
+                self.nb.http_session = _timeout_session()
                 self.use_api = True
             except ImportError:
                 print("⚠️  pynetbox not installed. Falling back to JSON mock mode.")

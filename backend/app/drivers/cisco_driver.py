@@ -68,6 +68,12 @@ class CiscoIOSDriver(BaseNetworkDriver):
         # caller is responsible for calling commit() once when finished.
         self.defer_save = False
         self._unsaved_changes = False
+        # Whether this session is known to be in enable mode. Checking costs a
+        # prompt read, which on this switch intermittently burns the whole
+        # CISCO_READ_TIMEOUT (30s observed, twice in one run) -- and a session
+        # does not silently leave enable mode, so re-checking before every
+        # config step is a repeated chance to lose 30s for no information.
+        self._enable_confirmed = False
 
     def commit(self) -> bool:
         """Write the running configuration to flash, once.
@@ -180,6 +186,9 @@ class CiscoIOSDriver(BaseNetworkDriver):
         except Exception as e:
             self.logger.error(f"Error during disconnect: {str(e)}")
             return False
+        finally:
+            # The next session must prove enable mode for itself.
+            self._enable_confirmed = False
     
     def _execute_command(self, command: str, enable_mode: bool = False) -> str:
         """
@@ -478,18 +487,24 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # three such failures is ~270s of pure waiting. Re-sync first, and
             # retry the check once, so a stale prompt cannot fail the step or
             # burn the timeout.
-            _te = time.time()
-            try:
-                if not self.connection.check_enable_mode():
-                    self.connection.enable()
-            except Exception as e:
-                self.logger.warning(
-                    f"Enable-mode check failed after {time.time()-_te:.1f}s ({e}); "
-                    f"re-syncing and retrying")
-                self._resync_channel()
-                if not self.connection.check_enable_mode():
-                    self.connection.enable()
-            self.logger.info(f"[TIMING] enable-mode check took {time.time()-_te:.1f}s")
+            # Checked once per session, not per config step -- see
+            # _enable_confirmed. A session does not drop out of enable mode on
+            # its own, so the repeat reads bought nothing and each was a chance
+            # to lose a full read timeout.
+            if not self._enable_confirmed:
+                _te = time.time()
+                try:
+                    if not self.connection.check_enable_mode():
+                        self.connection.enable()
+                except Exception as e:
+                    self.logger.warning(
+                        f"Enable-mode check failed after {time.time()-_te:.1f}s ({e}); "
+                        f"re-syncing and retrying")
+                    self._resync_channel()
+                    if not self.connection.check_enable_mode():
+                        self.connection.enable()
+                self._enable_confirmed = True
+                self.logger.info(f"[TIMING] enable-mode check took {time.time()-_te:.1f}s")
                 
             # Slow legacy switches (e.g. 2960) can be sluggish returning the
             # config prompt; without a generous read_timeout Netmiko raises

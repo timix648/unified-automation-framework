@@ -31,7 +31,12 @@ from app.services.device_manager import DeviceFactory
 from app.services.kill_switch import KillSwitchService
 from app.services.monitor import NetworkMonitor
 from app.services.wol import send_magic_packet
-from app.services.scheduler import auto_enforce_time_policy, auto_scan_for_rogues
+from app.services.scheduler import (
+    auto_enforce_time_policy,
+    auto_scan_for_rogues,
+    pause_device_jobs,
+    resume_device_jobs,
+)
 from app.core.config import settings
 from app.core.security import audit_logger, get_current_user, RoleChecker
 from app.core.security import user_db
@@ -1114,7 +1119,19 @@ async def provision_network(request: NetworkProvisionRequest, current_user: dict
 
     The user only provides high-level intent (network name, subnet, VLAN ID, etc.)
     and the system handles the vendor-specific implementation automatically.
+
+    Background jobs that touch the same devices are paused for the duration --
+    see pause_device_jobs. An operator action takes precedence over a poll.
     """
+    _paused_jobs = pause_device_jobs("network provisioning")
+    try:
+        return await _provision_network_impl(request, current_user)
+    finally:
+        resume_device_jobs(_paused_jobs)
+
+
+async def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict):
+    """The provisioning work itself; see provision_network for the wrapper."""
     results = {
         "network_name": request.network_name,
         "vlan_id": request.vlan_id,
@@ -1660,7 +1677,19 @@ async def list_segments(current_user: dict = Depends(get_current_user)):
 @router.post("/provision/deprovision")
 async def deprovision_network(request: DeprovisionRequest,
                               current_user: dict = Depends(require_admin)):
-    """Remove a network segment across Cisco + MikroTik + UniFi in one action."""
+    """Remove a network segment across Cisco + MikroTik + UniFi in one action.
+
+    As with provisioning, background device jobs are paused for the duration.
+    """
+    _paused_jobs = pause_device_jobs("network de-provisioning")
+    try:
+        return await _deprovision_network_impl(request, current_user)
+    finally:
+        resume_device_jobs(_paused_jobs)
+
+
+async def _deprovision_network_impl(request: DeprovisionRequest, current_user: dict):
+    """The de-provisioning work itself; see deprovision_network for the wrapper."""
     results = {
         "network_name": request.network_name,
         "vlan_id": request.vlan_id,

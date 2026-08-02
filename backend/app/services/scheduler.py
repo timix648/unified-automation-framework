@@ -412,3 +412,70 @@ def start_scheduler():
     logger.info(f"[SYSTEM] Background Scheduler Started.")
     logger.info(f"   - Time Policy: every {TIME_POLICY_INTERVAL_MINUTES} min")
     logger.info(f"   - Security Scan: every {SECURITY_SCAN_INTERVAL_MINUTES} min")
+
+# =============================================================================
+# EXCLUSIVE DEVICE ACCESS FOR ADMIN OPERATIONS
+# =============================================================================
+# The scheduled jobs and the provisioning API both open SSH sessions to the
+# same switch. A Catalyst 2960 grants roughly one usable session at a time, so
+# a scan firing mid-provision takes the session and the provision fails with
+# "No existing session" -- observed repeatedly, and the reason these jobs were
+# being switched off entirely during testing.
+#
+# Disabling the jobs is the wrong trade: they ARE the rogue-detection and
+# time-based-access features. Instead an admin operation pauses them for its
+# duration and restores them afterwards. An operator action taking precedence
+# over a background poll is the correct precedence, and the job's original due
+# time is remembered so its cadence is not silently reset on every provision.
+
+_DEVICE_JOB_IDS = ("rogue_scan", "time_policy")
+
+# Grace period before a job that came due DURING the operation is allowed to
+# run, so it does not fire the instant provisioning releases the device.
+_RESUME_GRACE_SECONDS = 30
+
+
+def pause_device_jobs(reason: str = "admin operation") -> Dict[str, Any]:
+    """Pause device-touching jobs, remembering when each was next due.
+
+    Returns a token to hand back to resume_device_jobs(). Never raises: failing
+    to pause must not prevent the operation the caller is about to perform.
+    """
+    remembered: Dict[str, Any] = {}
+    for job_id in _DEVICE_JOB_IDS:
+        try:
+            job = scheduler.get_job(job_id)
+            if job is None:
+                continue
+            remembered[job_id] = job.next_run_time
+            job.pause()
+        except Exception as e:
+            logger.warning(f"[SCHEDULER] Could not pause '{job_id}': {e}")
+    if remembered:
+        logger.info(f"[SCHEDULER] Paused {len(remembered)} device job(s) for {reason}")
+    return remembered
+
+
+def resume_device_jobs(remembered: Optional[Dict[str, Any]] = None) -> None:
+    """Resume jobs paused by pause_device_jobs, restoring their original due time.
+
+    A job whose due time passed while it was paused is given a short grace
+    period rather than firing immediately, so it does not grab the switch the
+    moment provisioning lets go of it.
+    """
+    for job_id in _DEVICE_JOB_IDS:
+        try:
+            job = scheduler.get_job(job_id)
+            if job is None:
+                continue
+            job.resume()
+            original = (remembered or {}).get(job_id)
+            if original is None:
+                continue
+            earliest = datetime.datetime.now(original.tzinfo) + datetime.timedelta(
+                seconds=_RESUME_GRACE_SECONDS)
+            job.modify(next_run_time=max(original, earliest))
+        except Exception as e:
+            logger.warning(f"[SCHEDULER] Could not resume '{job_id}': {e}")
+    if remembered:
+        logger.info(f"[SCHEDULER] Resumed {len(remembered)} device job(s)")

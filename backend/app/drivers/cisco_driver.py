@@ -248,9 +248,18 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # which is sized for multi-command config sets over a slow link. With
             # the config timeout (and retries) a single unverifiable step could
             # block for many minutes, which is worse than the problem being fixed.
+            # cmd_verify=False is essential, not an optimisation. Netmiko
+            # normally waits to see the command echoed back before reading the
+            # output; this switch intermittently stops echoing, so the read
+            # burns its whole timeout even though the command ran and the
+            # output is sitting there. Measured on the same session: an
+            # echo-verified 'show users' timed out, the identical read with
+            # cmd_verify=False returned in 0.5s. The config path already does
+            # this -- the verification reads had been left behind.
             return self.connection.send_command(
                 command,
                 read_timeout=int(os.getenv("CISCO_VERIFY_READ_TIMEOUT", "15")),
+                cmd_verify=False,
             ) or ""
         except Exception as e:
             self.logger.warning(f"Verification read failed for '{command}': {e}")

@@ -458,9 +458,24 @@ class CiscoIOSDriver(BaseNetworkDriver):
             raise ConnectionError("Not connected to device")
             
         try:
-            # Ensure we're in enable mode
-            if not self.connection.check_enable_mode():
-                self.connection.enable()
+            # Ensure we're in enable mode.
+            #
+            # check_enable_mode() reads the prompt, and on this switch that read
+            # is what fails with "Pattern not detected: '[>#]'" -- BEFORE any
+            # command is sent, so the retry around send_config_set never saw it.
+            # Worse, the failure costs a full CISCO_READ_TIMEOUT (90s default)
+            # each time, which is where most of a slow provision actually goes:
+            # three such failures is ~270s of pure waiting. Re-sync first, and
+            # retry the check once, so a stale prompt cannot fail the step or
+            # burn the timeout.
+            try:
+                if not self.connection.check_enable_mode():
+                    self.connection.enable()
+            except Exception as e:
+                self.logger.warning(f"Enable-mode check failed ({e}); re-syncing and retrying")
+                self._resync_channel()
+                if not self.connection.check_enable_mode():
+                    self.connection.enable()
                 
             # Slow legacy switches (e.g. 2960) can be sluggish returning the
             # config prompt; without a generous read_timeout Netmiko raises

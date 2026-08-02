@@ -229,6 +229,20 @@ class CiscoIOSDriver(BaseNetworkDriver):
         try:
             if not self.connection.check_enable_mode():
                 self.connection.enable()
+
+            # Re-synchronise the prompt before reading.
+            #
+            # A verification read issued straight after send_config_set() cannot
+            # match the prompt and burns its entire timeout -- measured on the
+            # 2960 as a 15s timeout followed by a 15s retry, ~32s of dead time
+            # per verification point, minutes across a provision. find_prompt()
+            # costs 0.1s and makes the same read return in 5s with a real
+            # answer instead of "could not check".
+            try:
+                self.connection.find_prompt()
+            except Exception:
+                pass   # best-effort: fall through and let the read try anyway
+
             # A short, SEPARATE timeout. These are single 'show' commands that
             # answer in a second or two; they must not inherit CISCO_READ_TIMEOUT,
             # which is sized for multi-command config sets over a slow link. With

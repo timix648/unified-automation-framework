@@ -379,6 +379,15 @@ def start_scheduler():
     # APScheduler treats an interval of 0 as "run continuously" rather than
     # "never", so the guard is required -- without it, setting 0 to quieten the
     # job does the opposite and hammers the switch.
+    # APScheduler drops a run outright if the scheduler thread wakes more than
+    # misfire_grace_time late, and the default is a single second -- on a busy
+    # host that silently skipped whole security scans (observed missed by 1.2s
+    # and 1.6s). Neither of these jobs cares about running a little late, so the
+    # grace is a full interval: a run is either picked up before the next one is
+    # due or coalesced into it, but never dropped without being noticed.
+    def _grace(minutes: int) -> int:
+        return max(60, minutes * 60)
+
     if TIME_POLICY_INTERVAL_MINUTES > 0:
         scheduler.add_job(
             auto_enforce_time_policy,
@@ -386,6 +395,8 @@ def start_scheduler():
             minutes=TIME_POLICY_INTERVAL_MINUTES,
             id='time_policy',
             replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=_grace(TIME_POLICY_INTERVAL_MINUTES),
             name='Time-Based Access Policy'
         )
     else:
@@ -402,6 +413,8 @@ def start_scheduler():
             minutes=SECURITY_SCAN_INTERVAL_MINUTES,
             id='rogue_scan',
             replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=_grace(SECURITY_SCAN_INTERVAL_MINUTES),
             name='Rogue Device Security Scan'
         )
     else:

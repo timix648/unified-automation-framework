@@ -20,6 +20,9 @@ from fastapi import HTTPException, Security, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pathlib import Path
 import json
+import threading
+import time
+import atexit
 import logging
 
 from app.core.config import settings
@@ -523,6 +526,18 @@ class AuditLogger:
     security-focused project.
     """
 
+    # Entries are held in memory and flushed on a short debounce rather than
+    # rewriting the file per entry.
+    #
+    # Previously every entry re-read, re-parsed and re-serialised the WHOLE
+    # log: measured at 229ms against a 247KB / 1,197-entry file, and O(n) --
+    # at the 10,000-entry cap it would approach two seconds. Since the audit
+    # middleware records every API request, and a security scan records many
+    # events, that cost serialised the entire API behind disk I/O: /api/health,
+    # which touches nothing, stalled for the duration of a scan. Appending in
+    # memory is O(1); the file is written at most once per flush interval.
+    MAX_ENTRIES = 10000
+
     def __init__(self, log_dir: str = "logs"):
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -530,22 +545,52 @@ class AuditLogger:
         if not self.audit_file.exists():
             self.audit_file.write_text("[]")
 
-    def _write_entry(self, entry: Dict):
-        """Append an audit entry to the persistent log file."""
+        self._lock = threading.Lock()
+        self._flush_interval = float(os.getenv("AUDIT_FLUSH_SECONDS", "2"))
+        self._last_flush = 0.0
+        self._dirty = False
         try:
-            with open(self.audit_file, 'r') as f:
-                log = json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            log = []
+            with open(self.audit_file, "r") as f:
+                self._entries = json.load(f)
+            if not isinstance(self._entries, list):
+                self._entries = []
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            self._entries = []
 
-        log.append(entry)
+        # Flush whatever is buffered when the process exits, so a clean
+        # shutdown never loses the tail of the audit trail.
+        atexit.register(self.flush)
 
-        # Keep last 10,000 entries to prevent unbounded growth
-        if len(log) > 10000:
-            log = log[-10000:]
+    def flush(self) -> None:
+        """Write buffered entries to disk. Safe to call at any time."""
+        with self._lock:
+            if not self._dirty:
+                return
+            entries = list(self._entries)
+            self._dirty = False
+            self._last_flush = time.time()
+        try:
+            tmp = self.audit_file.with_suffix(".json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(entries, f, indent=2)
+            os.replace(tmp, self.audit_file)   # atomic: never a half-written log
+        except OSError as e:
+            logger.error(f"Could not flush audit log: {e}")
 
-        with open(self.audit_file, 'w') as f:
-            json.dump(log, f, indent=2)
+    def _write_entry(self, entry: Dict):
+        """Record an audit entry, flushing to disk on a debounce."""
+        with self._lock:
+            self._entries.append(entry)
+            if len(self._entries) > self.MAX_ENTRIES:
+                del self._entries[:-self.MAX_ENTRIES]
+            self._dirty = True
+            due = (time.time() - self._last_flush) >= self._flush_interval
+
+        # Security events are persisted immediately -- losing a kill-switch
+        # record to a crash would defeat the point of the audit trail. Routine
+        # API access can wait for the next flush.
+        if due or entry.get("severity") == "WARNING":
+            self.flush()
 
         # Also print for real-time visibility in logs
         severity = entry.get("severity", "INFO")
@@ -588,12 +633,13 @@ class AuditLogger:
         })
 
     def get_recent_logs(self, limit: int = 100) -> List[Dict]:
-        """Retrieve recent audit log entries."""
-        try:
-            with open(self.audit_file, 'r') as f:
-                log = json.load(f)
-            return sorted(log, key=lambda x: x.get('timestamp', ''), reverse=True)[:limit]
-        except (json.JSONDecodeError, FileNotFoundError):
-            return []
+        """Retrieve recent audit log entries.
+
+        Served from memory, which is both faster and more correct than reading
+        the file: it includes entries buffered since the last flush.
+        """
+        with self._lock:
+            log = list(self._entries)
+        return sorted(log, key=lambda x: x.get('timestamp', ''), reverse=True)[:limit]
 
 audit_logger = AuditLogger()

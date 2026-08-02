@@ -902,6 +902,41 @@ class CiscoIOSDriver(BaseNetworkDriver):
     # MAC ADDRESS TABLE
     # =========================================================================
     
+    def find_port_via_cdp(self, platform_hint: str) -> Optional[str]:
+        """Find a neighbour's port from CDP rather than the MAC table.
+
+        The MAC table only remembers a device while it keeps sending frames --
+        entries expire after the ageing time (300s), so a quiet router or AP
+        vanishes from it without having moved, and uplink discovery then fails
+        or spends minutes retrying. CDP does not have that problem: neighbours
+        re-advertise every 60s whether or not they pass traffic, so the table
+        stays populated. It is also a single cheap read.
+
+        platform_hint is matched case-insensitively against CDP's Device ID and
+        Platform columns ("MikroTik", "cisco", ...). Returns the local
+        interface (e.g. "Fa0/23"), or None when the neighbour is not visible --
+        which is expected for kit that does not speak CDP, e.g. Ubiquiti.
+        """
+        if self.mock_mode:
+            return "Fa0/23"
+        hint = (platform_hint or "").lower()
+        if not hint:
+            return None
+        out = self._read_quietly("show cdp neighbors")
+        if not out:
+            return None
+        for line in out.splitlines():
+            if hint not in line.lower():
+                continue
+            # "MikroTik   Fas 0/23   112   R   MikroTik   ether2-master"
+            m = re.search(r'\b((?:Fas|Gig|Ten|Fa|Gi|Te)\s?\S+)', line)
+            if not m:
+                continue
+            port = m.group(1).replace(" ", "")
+            self.logger.info(f"CDP: {platform_hint} is on {port}")
+            return port
+        return None
+
     def find_port_for_mac(self, mac_address: str,
                           refresh_ip: Optional[str] = None) -> Optional[str]:
         """Discover WHICH switch port a given device's MAC is learned on.

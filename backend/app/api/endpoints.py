@@ -1408,7 +1408,22 @@ async def _provision_network_impl(request: NetworkProvisionRequest, current_user
                     peer_mac = (peer.get("mac_address") or peer.get("mac")
                                 or (peer.get("credentials", {}) or {}).get("mac"))
                     found = None
-                    if peer_mac:
+                    # CDP first: neighbours re-advertise every 60s regardless of
+                    # traffic, so a quiet router stays visible where its MAC
+                    # would have aged out of the forwarding table. One cheap
+                    # read instead of a MAC lookup, a ping and a retry.
+                    try:
+                        cdp_hint = ("mikrotik" if ("mikrotik" in plat or "routeros" in plat)
+                                    else "ubiquiti" if ("unifi" in plat or "ubiquiti" in plat)
+                                    else peer.get("name", ""))
+                        found = driver.find_port_via_cdp(cdp_hint)
+                    except Exception as e:
+                        driver.logger.warning(
+                            f"CDP discovery failed for {peer.get('name')}: {e}")
+
+                    # Fall back to the MAC table for neighbours that do not
+                    # speak CDP (Ubiquiti does not).
+                    if not found and peer_mac:
                         try:
                             # Pass the peer's IP so the switch can ping it and
                             # re-learn a MAC that has aged out of the table.

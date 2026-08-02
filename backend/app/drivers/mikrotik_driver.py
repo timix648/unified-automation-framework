@@ -9,6 +9,8 @@ import routeros_api
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import ipaddress
+import os
+import time
 
 from .base_driver import BaseNetworkDriver
 
@@ -113,7 +115,17 @@ class MikroTikDriver(BaseNetworkDriver):
                 port=self.api_port,
                 plaintext_login=True  # Use SSL in production!
             )
-            
+
+            # routeros_api defaults to a 15s socket timeout, and that is the
+            # source of the bare "timed out" failures during provisioning: the
+            # router is not unreachable, it simply takes longer than 15s to
+            # answer while it is busy applying a VLAN interface or a DHCP
+            # server. The step then fails and -- worse -- the rest of the
+            # MikroTik chain is skipped. Raised well above the observed answer
+            # time, and env-tunable for slower links.
+            self.connection.socket_timeout = float(
+                os.getenv("MIKROTIK_TIMEOUT", "45"))
+
             # Test connection
             api = self.connection.get_api()
             system_resource = api.get_resource('/system/resource')

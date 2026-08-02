@@ -902,7 +902,8 @@ class CiscoIOSDriver(BaseNetworkDriver):
     # MAC ADDRESS TABLE
     # =========================================================================
     
-    def find_port_for_mac(self, mac_address: str) -> Optional[str]:
+    def find_port_for_mac(self, mac_address: str,
+                          refresh_ip: Optional[str] = None) -> Optional[str]:
         """Discover WHICH switch port a given device's MAC is learned on.
 
         Replaces hardcoded uplink ports. UAF knows each managed device's MAC
@@ -933,6 +934,34 @@ class CiscoIOSDriver(BaseNetworkDriver):
                     return port
         except Exception as e:
             self.logger.error(f"find_port_for_mac failed: {e}")
+
+        # Not in the table -- most likely aged out rather than absent.
+        #
+        # A switch only remembers a MAC while it keeps seeing frames from it:
+        # entries expire after the MAC ageing time (300s by default on IOS).
+        # A quiet device -- an AP with no clients, a router that only answers --
+        # therefore disappears from the table without going anywhere, and
+        # uplink discovery then cannot find the port it is plugged into.
+        #
+        # Sending it a single ping forces a frame back through the switch,
+        # which re-learns the MAC. Costs about a second and turns an
+        # intermittent discovery failure into a reliable one.
+        try:
+            self.logger.info(
+                f"MAC {mac_address} not in table (likely aged out); "
+                f"pinging to refresh and retrying")
+            self._read_quietly(f"ping {refresh_ip} repeat 2 timeout 1") if refresh_ip else None
+            if refresh_ip:
+                time.sleep(1)
+                for entry in self.get_mac_address_table():
+                    if _norm(entry.get("mac_address", "")) == target:
+                        port = entry.get("interface")
+                        self.logger.info(
+                            f"Discovered {mac_address} on port {port} after refresh")
+                        return port
+        except Exception as e:
+            self.logger.warning(f"MAC-table refresh failed: {e}")
+
         self.logger.info(f"MAC {mac_address} not found in switch MAC table")
         return None
 

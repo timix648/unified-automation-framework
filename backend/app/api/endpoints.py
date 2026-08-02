@@ -1410,7 +1410,12 @@ async def _provision_network_impl(request: NetworkProvisionRequest, current_user
                     found = None
                     if peer_mac:
                         try:
-                            found = driver.find_port_for_mac(peer_mac)
+                            # Pass the peer's IP so the switch can ping it and
+                            # re-learn a MAC that has aged out of the table.
+                            found = driver.find_port_for_mac(
+                                peer_mac,
+                                refresh_ip=(peer.get("primary_ip") or peer.get("ip")),
+                            )
                         except Exception as e:
                             results["steps_failed"].append({
                                 "step": f"discover_{role}",

@@ -25,6 +25,7 @@ from nornir_netmiko.tasks import netmiko_send_command, netmiko_send_config
 from nornir_utils.plugins.functions import print_result
 from typing import Dict, List, Optional, Any, Callable
 import logging
+import os
 from datetime import datetime
 import json
 from nornir.core.filter import F
@@ -41,12 +42,21 @@ from app.inventory.netbox_client import NetboxInventory
 # ourselves and log clean one-liners instead.
 logging.getLogger("nornir").setLevel(logging.CRITICAL)
 logging.getLogger("nornir.core").setLevel(logging.CRITICAL)
-# Quiet the per-driver connection error logs during scans. The scheduler/task
-# layer reports unreachable devices as clean one-liners, so we don't need the
-# drivers' own \u274c error spam. Set to CRITICAL so genuine crashes still show.
-logging.getLogger("CiscoIOSDriver").setLevel(logging.CRITICAL)
-logging.getLogger("MikroTikDriver").setLevel(logging.CRITICAL)
-logging.getLogger("UniFiDriver").setLevel(logging.CRITICAL)
+# Quiet the per-driver connection noise during scans. The scheduler/task layer
+# reports unreachable devices as clean one-liners, so the drivers' own chatter
+# is redundant THERE.
+#
+# This used to be CRITICAL, which silenced the drivers everywhere -- importing
+# this module is a global, permanent side effect, so provisioning warnings,
+# retry messages and timing output were all discarded too. Debugging a failed
+# provision then meant reasoning from a bare exception string with none of the
+# driver's own account of what it tried. WARNING keeps the scan quiet while
+# leaving genuine problems visible; set DRIVER_LOG_LEVEL=INFO for detail.
+_DRIVER_LOG_LEVEL = getattr(
+    logging, os.getenv("DRIVER_LOG_LEVEL", "WARNING").upper(), logging.WARNING
+)
+for _drv_logger in ("CiscoIOSDriver", "MikroTikDriver", "UniFiDriver"):
+    logging.getLogger(_drv_logger).setLevel(_DRIVER_LOG_LEVEL)
 
 
 class DictInventory:

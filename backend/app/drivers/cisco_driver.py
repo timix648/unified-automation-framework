@@ -442,6 +442,25 @@ class CiscoIOSDriver(BaseNetworkDriver):
             f"{description} failed: {write_error} (and the device could not be "
             f"read back to confirm)")
 
+    def _leave_config_mode(self) -> None:
+        """Drop out of config mode with a raw 'end', no prompt matching.
+
+        Netmiko's exit_config_mode() verifies the prompt afterwards using its
+        own timeout, which ignores read_timeout and was measured costing 30s
+        per config set on this switch. 'end' is a single unambiguous keystroke
+        sequence that IOS always honours, so writing it directly and pausing
+        briefly is both faster and more reliable than asking netmiko to confirm
+        it. The next operation re-establishes context anyway.
+        """
+        if not self.connection:
+            return
+        try:
+            self.connection.write_channel("end\n")
+            time.sleep(0.6)
+            self.connection.clear_buffer()
+        except Exception as e:
+            self.logger.warning(f"Leaving config mode raised: {e}")
+
     def _resync_channel(self) -> None:
         """Return the session to a known enable prompt after a prompt-check failure.
 
@@ -521,6 +540,14 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 read_timeout=int(os.getenv('CISCO_READ_TIMEOUT', '60')),
                 delay_factor=2,
                 cmd_verify=False,
+                # Leave config mode ourselves, below. Netmiko's own
+                # exit_config_mode() does a prompt check with its OWN timeout
+                # that ignores read_timeout -- measured at 30s while
+                # CISCO_READ_TIMEOUT was 10s -- and it is the single biggest
+                # remaining source of dead time. Every manual recovery tonight
+                # that used exit_config_mode=False plus a raw 'end' succeeded
+                # where netmiko's path timed out.
+                exit_config_mode=False,
             )
             # Timed so a slow provision can be attributed to a specific step
             # instead of guessed at. Without this the only visible number is the
@@ -528,6 +555,7 @@ class CiscoIOSDriver(BaseNetworkDriver):
             _t0 = time.time()
             try:
                 output = self.connection.send_config_set(commands, **send_kwargs)
+                self._leave_config_mode()
                 self.logger.info(
                     f"[TIMING] config set ({commands[0][:34]}) took {time.time()-_t0:.1f}s")
             except Exception as first_error:

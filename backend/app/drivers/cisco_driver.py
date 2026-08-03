@@ -14,6 +14,12 @@ from datetime import datetime
 
 from .base_driver import BaseNetworkDriver
 
+# Most configuration lines to send to an interface in one go. Old IOS stops
+# echoing part-way through a long burst and never returns its prompt; four is
+# comfortably inside what a 2960 on 12.2 handles. Env-tunable for gear with a
+# roomier vty buffer.
+_MAX_CONFIG_LINES = max(2, int(os.getenv("CISCO_MAX_CONFIG_LINES", "4")))
+
 
 def _enable_legacy_ssh_algorithms():
     """Re-enable the legacy SSH algorithms that old IOS offers but modern
@@ -549,19 +555,50 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # config set can exceed it and fail with 'Pattern not detected'
             # even though the commands applied. Raise CISCO_READ_TIMEOUT
             # for remote deployments rather than editing code.
+            # cmd_verify=True is deliberate, and it is the expensive lesson of
+            # this driver. With it False, Netmiko writes every command without
+            # reading between them, so the switch's echo backs up in its vty
+            # output buffer and it stops mid-word. A session log caught it
+            # exactly: after five accepted commands the switch emitted
+            # "switchport port-security mac-" and never returned a prompt --
+            # the write had nowhere to go, and Netmiko waited out the full read
+            # timeout for a prompt that could not come. Reading after each
+            # command keeps the buffer drained. Measured over six repetitions
+            # of the same six-command set: False gave a pass at 56s, a
+            # ReadTimeout, and a cleanup that deadlocked too; True gave 5/6 and
+            # settled to ~4s once warm.
             send_kwargs = dict(
                 read_timeout=int(os.getenv('CISCO_READ_TIMEOUT', '60')),
                 delay_factor=2,
-                cmd_verify=False,
+                cmd_verify=True,
             )
+            # Draining after each command is necessary but not sufficient: the
+            # remaining 1-in-6 failures were all on the six-command port
+            # security set, while three-command sets never failed once across
+            # roughly fifteen observations. So also bound how much a single set
+            # can queue up. Interface sub-commands are order-independent and
+            # idempotent, and repeating the "interface X" header is free, so a
+            # long interface block is split rather than sent in one burst.
+            # Anything that is not an interface block (vlan N / name X, trunk
+            # definitions) is left intact -- those must stay together.
+            batches = [commands]
+            if len(commands) > _MAX_CONFIG_LINES and commands[0].lower().startswith("interface "):
+                header, rest = commands[0], commands[1:]
+                step = _MAX_CONFIG_LINES - 1
+                batches = [[header] + rest[i:i + step]
+                           for i in range(0, len(rest), step)]
+
             # Timed so a slow provision can be attributed to a specific step
             # instead of guessed at. Without this the only visible number is the
             # total, which says nothing about where the seconds went.
             _t0 = time.time()
             try:
-                output = self.connection.send_config_set(commands, **send_kwargs)
+                output = ""
+                for batch in batches:
+                    output += self.connection.send_config_set(batch, **send_kwargs)
                 self.logger.info(
-                    f"[TIMING] config set ({commands[0][:34]}) took {time.time()-_t0:.1f}s")
+                    f"[TIMING] config set ({commands[0][:34]}) took {time.time()-_t0:.1f}s"
+                    + (f" in {len(batches)} batches" if len(batches) > 1 else ""))
             except Exception as first_error:
                 # cmd_verify=False silences the per-command echo check, but NOT
                 # netmiko's own config_mode()/exit_config_mode() prompt checks.
@@ -572,10 +609,42 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 # idempotent (vlan N / name X / switchport access vlan N), so a
                 # repeat is harmless, and the caller verifies against the
                 # device afterwards regardless.
+                # Ask the switch what state it is actually in before re-sending.
+                #
+                # On this 2960 every one of these "failures" has turned out to
+                # be a false negative: the trunk edits, the VLAN assignments and
+                # the port-security sets were all confirmed applied on the
+                # console after the driver had reported them failed. Netmiko
+                # raises because it cannot match a prompt, which says nothing
+                # about whether the commands ran. Re-sending is therefore a
+                # second full config set -- and a second chance to stall -- to
+                # redo work the device has already done.
                 self.logger.warning(
-                    f"Config set failed ({first_error}); re-syncing channel and retrying once")
+                    f"Config set failed ({first_error}); re-syncing and checking "
+                    f"whether it applied anyway")
                 self._resync_channel()
-                output = self.connection.send_config_set(commands, **send_kwargs)
+
+                applied = None
+                if commands[0].lower().startswith("interface "):
+                    iface = commands[0].split(None, 1)[1].strip()
+                    running = self._read_quietly(f"show running-config interface {iface}")
+                    if running is not None:
+                        wanted = [c.strip().lower() for c in commands[1:]]
+                        present = running.lower()
+                        applied = all(w in present for w in wanted)
+
+                if applied:
+                    self.logger.info(
+                        f"Config set reported an error but the device shows it "
+                        f"applied — accepting, not re-sending.")
+                    output = ""
+                else:
+                    # Either the device says the change is absent, or it could
+                    # not be read back. Re-send: every set built here is
+                    # idempotent, so repeating is harmless.
+                    output = ""
+                    for batch in batches:
+                        output += self.connection.send_config_set(batch, **send_kwargs)
             
             # Persist. On a 2960 'write memory' is a flash write costing
             # 5-15s AND spiking CPU, which is what makes the NEXT step's

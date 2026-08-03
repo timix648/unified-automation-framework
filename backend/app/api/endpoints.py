@@ -1416,7 +1416,37 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                 # while UAF trunked an empty Fa0/24). Env vars remain as a
                 # fallback for devices whose MAC isn't known/learned yet.
                 uplinks = {}
-                for peer in devices:
+
+                # ...but if the operator has already declared where the uplinks
+                # are, believe them and skip the search entirely. Discovery is
+                # several reads per peer, and a read on a session the switch has
+                # stopped answering costs the full CISCO_READ_TIMEOUT before it
+                # gives up: one measured run spent ~600s of a 900s provision
+                # re-discovering ports that .env already named. De-provisioning
+                # has always trusted these values; provisioning now matches it.
+                _env_ap = os.getenv("AP_UPLINK_PORT")
+                _env_router = os.getenv("ROUTER_UPLINK_PORT")
+                _peer_roles = {
+                    ("router_uplink" if ("mikrotik" in (p.get("platform") or "").lower()
+                                         or "routeros" in (p.get("platform") or "").lower())
+                     else "ap_uplink" if ("unifi" in (p.get("platform") or "").lower()
+                                          or "ubiquiti" in (p.get("platform") or "").lower())
+                     else None)
+                    for p in devices
+                    if "cisco" not in (p.get("platform") or "").lower()
+                }
+                _needed = {r for r in _peer_roles if r}
+                _configured = {"ap_uplink": _env_ap, "router_uplink": _env_router}
+                if _needed and all(_configured.get(r) for r in _needed):
+                    for role in _needed:
+                        uplinks[role] = _configured[role]
+                    driver.logger.info(
+                        f"Uplinks taken from configuration, skipping discovery: {uplinks}")
+                    devices_to_discover = []
+                else:
+                    devices_to_discover = devices
+
+                for peer in devices_to_discover:
                     plat = (peer.get("platform") or "").lower()
                     if "cisco" in plat:
                         continue

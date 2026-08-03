@@ -164,7 +164,32 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # Enter enable mode if secret is provided
             if device_params['secret']:
                 self.connection.enable()
-                
+
+            # Stop the switch pushing asynchronous log notices into THIS vty.
+            # Changing a port's VLAN bounces the link, so the switch emits
+            # %LINK-3-UPDOWN / %LINEPROTO-5-UPDOWN mid-command; those bytes
+            # interleave with the command echo, Netmiko's prompt match never
+            # lands, and the write is reported as "Pattern not detected:
+            # 'configure terminal'" even though it usually applied.
+            #
+            # Measured on this 2960, same commands, same session, order
+            # reversed to rule out warm-up: assigning an access VLAN took
+            # 40.8s and 37.7s (one outright ReadTimeout) with monitoring on,
+            # versus 4.8s, 7.9s and 6.8s with it off. This is the difference
+            # between a provisioning run that completes and one that does not.
+            #
+            # Best effort: the session is still usable if the switch refuses.
+            try:
+                _tm = time.time()
+                self.connection.send_command_timing("terminal no monitor",
+                                                    read_timeout=20)
+                self.logger.info(
+                    f"[TIMING] terminal no monitor took {time.time()-_tm:.1f}s")
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not silence console notices on this session "
+                    f"({type(e).__name__}); writes may be slower")
+
             self.logger.info(f"Connected to Cisco device {self.device_config['host']}")
             return True
             

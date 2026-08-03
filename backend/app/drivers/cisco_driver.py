@@ -132,7 +132,14 @@ class CiscoIOSDriver(BaseNetworkDriver):
                 # Old/slow IOS (2960 on 12.2) returns prompts slowly and limits
                 # concurrent SSH sessions. Give Netmiko more patience so a slow
                 # prompt isn't mistaken for a failure ("Pattern not detected").
-                'read_timeout_override': 30,
+                #
+                # This is a ceiling, not a delay: Netmiko returns the moment the
+                # prompt matches, so raising it slows nothing down that already
+                # works -- it only stops a slow-but-fine command being called a
+                # failure. It was pinned at 30 while CISCO_READ_TIMEOUT governed
+                # everything else, so reads silently ignored that setting; both
+                # now follow the same knob.
+                'read_timeout_override': int(os.getenv('CISCO_READ_TIMEOUT', '60')),
                 'global_delay_factor': 2,
                 # Let Paramiko fall back to the ssh-rsa host key old switches use
                 # (it otherwise insists on the rsa-sha2 variants they don't have).

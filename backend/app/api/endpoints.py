@@ -12,6 +12,7 @@ ADDITIONS:
 
 import asyncio
 import os
+import re
 import socket
 import time
 from datetime import datetime
@@ -182,6 +183,26 @@ def _tcp_probe(host: str, port: int, timeout: float = HEALTH_PROBE_TIMEOUT) -> b
             return True
     except Exception:
         return False
+
+
+def _same_port(a: str, b: str) -> bool:
+    """Do two interface names refer to the same physical port?
+
+    CDP abbreviates ("Fas 0/23"), configuration spells it out
+    ("FastEthernet0/23"), and IOS accepts both. Compare on the media letter
+    plus the slot/port numbers so "Fas 0/23", "Fa0/23" and "FastEthernet0/23"
+    all match, while Fa0/23 and Gi0/23 correctly do not.
+    """
+    def key(name: str):
+        if not name:
+            return None
+        m = re.match(r"\s*([A-Za-z]+)\s*([\d/.]+)\s*$", str(name))
+        if not m:
+            return None
+        return m.group(1)[:2].lower(), m.group(2)
+
+    ka, kb = key(a), key(b)
+    return ka is not None and ka == kb
 
 # ============================================================================
 # DATA MODELS (Request/Response Schemas)
@@ -1417,34 +1438,73 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                 # fallback for devices whose MAC isn't known/learned yet.
                 uplinks = {}
 
-                # ...but if the operator has already declared where the uplinks
-                # are, believe them and skip the search entirely. Discovery is
-                # several reads per peer, and a read on a session the switch has
-                # stopped answering costs the full CISCO_READ_TIMEOUT before it
-                # gives up: one measured run spent ~600s of a 900s provision
-                # re-discovering ports that .env already named. De-provisioning
-                # has always trusted these values; provisioning now matches it.
+                # A configured uplink is a HINT, not an answer. Full discovery
+                # is several reads per peer and a read on a session the switch
+                # has stopped answering costs the whole CISCO_READ_TIMEOUT --
+                # one measured run spent ~600s of a 900s provision that way. But
+                # simply trusting .env re-creates the failure the comment above
+                # describes: re-cable the router and UAF silently trunks an
+                # empty port while the real uplink carries nothing, and the run
+                # still reports success.
+                #
+                # So confirm the hint cheaply instead. One CDP read names every
+                # neighbour and the port it is on; if it agrees with .env there
+                # is nothing to discover, and if it disagrees -- or cannot be
+                # read -- fall through to the full search. Costs one read for
+                # the common case, and re-cabling is still detected.
                 _env_ap = os.getenv("AP_UPLINK_PORT")
                 _env_router = os.getenv("ROUTER_UPLINK_PORT")
-                _peer_roles = {
-                    ("router_uplink" if ("mikrotik" in (p.get("platform") or "").lower()
-                                         or "routeros" in (p.get("platform") or "").lower())
-                     else "ap_uplink" if ("unifi" in (p.get("platform") or "").lower()
-                                          or "ubiquiti" in (p.get("platform") or "").lower())
-                     else None)
-                    for p in devices
-                    if "cisco" not in (p.get("platform") or "").lower()
-                }
-                _needed = {r for r in _peer_roles if r}
+
+                def _role_of(peer) -> Optional[str]:
+                    plat = (peer.get("platform") or "").lower()
+                    if "mikrotik" in plat or "routeros" in plat:
+                        return "router_uplink"
+                    if "unifi" in plat or "ubiquiti" in plat:
+                        return "ap_uplink"
+                    return None
+
+                _needed = {r for r in (_role_of(p) for p in devices
+                                       if "cisco" not in (p.get("platform") or "").lower())
+                           if r}
                 _configured = {"ap_uplink": _env_ap, "router_uplink": _env_router}
+
+                devices_to_discover = devices
                 if _needed and all(_configured.get(r) for r in _needed):
+                    confirmed = {}
                     for role in _needed:
-                        uplinks[role] = _configured[role]
-                    driver.logger.info(
-                        f"Uplinks taken from configuration, skipping discovery: {uplinks}")
+                        hint = "mikrotik" if role == "router_uplink" else "ubiquiti"
+                        try:
+                            seen = driver.find_port_via_cdp(hint)
+                        except Exception as e:
+                            driver.logger.warning(
+                                f"CDP read failed for {role} ({type(e).__name__})")
+                            seen = None
+
+                        if seen and _same_port(seen, _configured[role]):
+                            confirmed[role] = _configured[role]
+                        elif seen:
+                            # The switch says otherwise. Believe the switch --
+                            # this is the re-cabling case the configuration
+                            # cannot know about.
+                            driver.logger.warning(
+                                f"{role}: configured {_configured[role]} but the device "
+                                f"is on {seen} -- trusting the switch, not the config")
+                            confirmed[role] = seen
+                        else:
+                            # CDP saw nothing. That is not evidence against the
+                            # configured port -- Ubiquiti APs advertise LLDP,
+                            # not CDP, so the access point is never visible this
+                            # way. Silence is no contradiction, so take what the
+                            # operator declared and say plainly that it is
+                            # unverified.
+                            confirmed[role] = _configured[role]
+                            driver.logger.info(
+                                f"{role}: no CDP neighbour to check against; using "
+                                f"configured {_configured[role]} (unverified)")
+
+                    uplinks.update(confirmed)
+                    driver.logger.info(f"Uplinks resolved: {uplinks}")
                     devices_to_discover = []
-                else:
-                    devices_to_discover = devices
 
                 for peer in devices_to_discover:
                     plat = (peer.get("platform") or "").lower()

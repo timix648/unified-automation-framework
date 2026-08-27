@@ -185,11 +185,13 @@ class State(rx.State):
     # FastEthernet because this switch (WS-C2960-24LT-L) has two Gigabit
     # uplinks and 24 FastEthernet access ports -- the previous
     # GigabitEthernet0/1-2 default named ports that do not exist on it.
+    # Ports 13/14/16 rather than 1-3: those are dead on this unit, and 15
+    # is skipped because the access point is cabled there and needs a trunk.
     prov_name: str = "UAF-210408501"
     prov_vlan: str = "210"
     prov_subnet: str = "192.168.210.0/24"
     prov_gateway: str = "192.168.210.1"
-    prov_ports: str = "FastEthernet0/1, FastEthernet0/2, FastEthernet0/3"
+    prov_ports: str = "FastEthernet0/13, FastEthernet0/14, FastEthernet0/16"
     prov_ssid: str = "UAF-210408501"
     prov_psk: str = "Unilag210408501"
     prov_dhcp: bool = True
@@ -203,7 +205,7 @@ class State(rx.State):
     deprov_name: str = "UAF-210408501"
     deprov_vlan: str = "210"
     deprov_subnet: str = "192.168.210.0/24"
-    deprov_ports: str = "FastEthernet0/1, FastEthernet0/2, FastEthernet0/3"
+    deprov_ports: str = "FastEthernet0/13, FastEthernet0/14, FastEthernet0/16"
     deprov_ssid: str = "UAF-210408501"
     deprov_running: bool = False
     deprov_results: List[Dict[str, Any]] = []

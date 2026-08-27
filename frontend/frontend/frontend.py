@@ -1411,7 +1411,13 @@ class State(rx.State):
             payload["wifi_ssid"] = self.prov_ssid.strip()
             payload["wifi_password"] = self.prov_psk
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            # 120s used to cut in below the work it was waiting on: a
+            # provision spanning three vendors has been measured from 56s
+            # to 159s, so the client gave up while the backend was still
+            # succeeding and the page reported a connection problem for a
+            # run that completed with every step OK. The request is the
+            # slow part, not a hung one -- wait for it.
+            async with httpx.AsyncClient(timeout=600) as client:
                 r = await client.post(
                     f"{API_BASE}/provision/network",
                     headers=self._headers(),
@@ -1522,7 +1528,13 @@ class State(rx.State):
         if self.deprov_ssid.strip():
             payload["ssid"] = self.deprov_ssid.strip()
         try:
-            async with httpx.AsyncClient(timeout=120) as client:
+            # 120s used to cut in below the work it was waiting on: a
+            # provision spanning three vendors has been measured from 56s
+            # to 159s, so the client gave up while the backend was still
+            # succeeding and the page reported a connection problem for a
+            # run that completed with every step OK. The request is the
+            # slow part, not a hung one -- wait for it.
+            async with httpx.AsyncClient(timeout=600) as client:
                 r = await client.post(
                     f"{API_BASE}/provision/deprovision",
                     headers=self._headers(),

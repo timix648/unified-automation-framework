@@ -185,6 +185,21 @@ def _tcp_probe(host: str, port: int, timeout: float = HEALTH_PROBE_TIMEOUT) -> b
         return False
 
 
+def _lookup_port(port_state: dict, name: str) -> Optional[dict]:
+    """Find a port in a state map, tolerating abbreviated interface names.
+
+    The switch reports "Fa0/21" while configuration says "FastEthernet0/21";
+    both name the same port, so match on the media letters plus the numbers
+    rather than on the string.
+    """
+    if not port_state:
+        return None
+    for key, val in port_state.items():
+        if _same_port(key, name):
+            return val
+    return None
+
+
 def _same_port(a: str, b: str) -> bool:
     """Do two interface names refer to the same physical port?
 
@@ -1429,6 +1444,13 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                     driver = DeviceFactory.get_driver(device)
                     driver.defer_save = True   # one flash write for both trunks
                     driver.connect()
+                elif hasattr(driver, "ensure_connected"):
+                    # The session held since Step 1 may have died during the
+                    # access-port work. Everything below -- reading CDP to place
+                    # the uplinks, and the trunk writes themselves -- depends on
+                    # it, and a dead session makes those reads fail in a way that
+                    # looks like "no neighbour found". Reconnect first.
+                    driver.ensure_connected()
 
                 # DISCOVER the uplinks rather than trusting hardcoded ports.
                 # For each non-Cisco managed device, look its MAC up in the
@@ -1473,12 +1495,18 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                     confirmed = {}
                     for role in _needed:
                         hint = "mikrotik" if role == "router_uplink" else "ubiquiti"
+                        seen, readable = None, True
                         try:
                             seen = driver.find_port_via_cdp(hint)
                         except Exception as e:
+                            # Could not ask the switch at all. Distinct from the
+                            # switch answering "no such neighbour": one is
+                            # absence of evidence, the other is evidence of
+                            # absence, and only the latter makes the configured
+                            # port a reasonable assumption.
+                            readable = False
                             driver.logger.warning(
                                 f"CDP read failed for {role} ({type(e).__name__})")
-                            seen = None
 
                         if seen and _same_port(seen, _configured[role]):
                             confirmed[role] = _configured[role]
@@ -1490,21 +1518,37 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                                 f"{role}: configured {_configured[role]} but the device "
                                 f"is on {seen} -- trusting the switch, not the config")
                             confirmed[role] = seen
-                        else:
-                            # CDP saw nothing. That is not evidence against the
+                        elif readable:
+                            # The switch answered and reported no such
+                            # neighbour. That is not evidence against the
                             # configured port -- Ubiquiti APs advertise LLDP,
                             # not CDP, so the access point is never visible this
                             # way. Silence is no contradiction, so take what the
-                            # operator declared and say plainly that it is
-                            # unverified.
+                            # operator declared and say plainly it is unverified.
                             confirmed[role] = _configured[role]
                             driver.logger.info(
                                 f"{role}: no CDP neighbour to check against; using "
                                 f"configured {_configured[role]} (unverified)")
+                        else:
+                            # The switch could not be asked. Do not quietly
+                            # assume the configured port is still right: that is
+                            # exactly how an empty port gets trunked while the
+                            # run reports success. Fall through to full
+                            # discovery, which reconnects and looks properly.
+                            driver.logger.warning(
+                                f"{role}: could not read CDP, so the configured "
+                                f"{_configured[role]} cannot be trusted; discovering")
 
                     uplinks.update(confirmed)
-                    driver.logger.info(f"Uplinks resolved: {uplinks}")
-                    devices_to_discover = []
+                    if len(confirmed) == len(_needed):
+                        driver.logger.info(f"Uplinks resolved: {uplinks}")
+                        devices_to_discover = []
+                    else:
+                        # At least one uplink could not be settled from CDP, so
+                        # the full search still has to run. Anything already
+                        # confirmed stays; discovery fills the rest.
+                        driver.logger.info(
+                            f"Uplinks partly resolved {uplinks}; discovering the remainder")
 
                 for peer in devices_to_discover:
                     plat = (peer.get("platform") or "").lower()
@@ -1555,6 +1599,53 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                 # Fall back to configured defaults for anything not discovered.
                 uplinks.setdefault("ap_uplink", os.getenv("AP_UPLINK_PORT", "Fa0/23"))
                 uplinks.setdefault("router_uplink", os.getenv("ROUTER_UPLINK_PORT", "Fa0/24"))
+
+                # Check the ports we are about to trunk actually exist and have
+                # something on them. A configured port name is only a claim, and
+                # a wrong one fails silently: the earlier default named
+                # GigabitEthernet0/3, which this switch model does not have at
+                # all, and provisioning trunked it and reported success. One
+                # read of the interface table covers every uplink at once.
+                try:
+                    _ps = driver.get_port_status()
+                    port_state = {i.get("interface"): i
+                                  for i in _ps.get("interfaces", [])
+                                  if i.get("interface")}
+                except Exception as e:
+                    # If the switch cannot be read, do not invent a verdict --
+                    # skip the check and let the trunk attempt speak for itself.
+                    driver.logger.warning(
+                        f"Could not read interface table to validate uplinks "
+                        f"({type(e).__name__}); trunking without that check")
+                    port_state = {}
+
+                for role, up_port in list(uplinks.items()):
+                    state = _lookup_port(port_state, up_port)
+                    if state is None and port_state:
+                        # The switch listed its interfaces and this is not among
+                        # them. Configuration is wrong; trunking would be a no-op
+                        # dressed up as a success.
+                        results["steps_failed"].append({
+                            "step": f"trunk_{role}",
+                            "device": device["name"],
+                            "port": up_port,
+                            "error": (f"{up_port} does not exist on {device['name']}. "
+                                      f"Check the uplink setting in configuration."),
+                        })
+                        driver.logger.error(
+                            f"{role}: {up_port} is not a port on this switch -- refusing "
+                            f"to trunk a port that is not there")
+                        uplinks.pop(role, None)
+                    elif state and state.get("status") not in ("connected", "trunking"):
+                        # The port exists but nothing is plugged into it. Still
+                        # worth trunking -- the cable may be reconnected later --
+                        # but the operator should be told the segment does not
+                        # currently reach that device.
+                        results.setdefault("warnings", []).append(
+                            f"{role} {up_port} is {state.get('status')}: the VLAN will be "
+                            f"allowed on it, but nothing is connected there right now.")
+                        driver.logger.warning(
+                            f"{role}: {up_port} is {state.get('status')}, trunking anyway")
 
                 for role, up_port in uplinks.items():
                     try:

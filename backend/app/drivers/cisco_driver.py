@@ -632,12 +632,41 @@ class CiscoIOSDriver(BaseNetworkDriver):
             # long interface block is split rather than sent in one burst.
             # Anything that is not an interface block (vlan N / name X, trunk
             # definitions) is left intact -- those must stay together.
-            batches = [commands]
-            if len(commands) > _MAX_CONFIG_LINES and commands[0].lower().startswith("interface "):
-                header, rest = commands[0], commands[1:]
-                step = _MAX_CONFIG_LINES - 1
-                batches = [[header] + rest[i:i + step]
-                           for i in range(0, len(rest), step)]
+            # Split on interface boundaries FIRST. This used to treat the whole
+            # set as a single interface block and re-use commands[0] as the
+            # header for every batch, which quietly corrupted any set spanning
+            # several interfaces: each batch re-opened the FIRST interface and
+            # ended on the next one's "interface X" line, so that interface
+            # received its header and never the sub-command beneath it.
+            #
+            # De-provisioning three access ports is exactly that shape, and the
+            # damage was silent and lasting -- ports two and three kept
+            # "switchport access vlan N" while the VLAN itself was deleted a
+            # moment later, which leaves them assigned to a VLAN that no longer
+            # exists and therefore dead. Two ports on this switch had been in
+            # that state, and nothing reported a failure.
+            def _interface_blocks(cmds):
+                blocks, cur = [], []
+                for c in cmds:
+                    if c.lower().startswith("interface ") and cur:
+                        blocks.append(cur)
+                        cur = [c]
+                    else:
+                        cur.append(c)
+                if cur:
+                    blocks.append(cur)
+                return blocks
+
+            batches = []
+            for block in _interface_blocks(commands):
+                if (len(block) > _MAX_CONFIG_LINES
+                        and block[0].lower().startswith("interface ")):
+                    header, rest = block[0], block[1:]
+                    step = _MAX_CONFIG_LINES - 1
+                    batches += [[header] + rest[i:i + step]
+                                for i in range(0, len(rest), step)]
+                else:
+                    batches.append(block)
 
             # Timed so a slow provision can be attributed to a specific step
             # instead of guessed at. Without this the only visible number is the

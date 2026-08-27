@@ -1494,7 +1494,23 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                 if _needed and all(_configured.get(r) for r in _needed):
                     confirmed = {}
                     for role in _needed:
-                        hint = "mikrotik" if role == "router_uplink" else "ubiquiti"
+                        if role == "ap_uplink":
+                            # Ubiquiti does not advertise CDP, so this read can
+                            # only ever come back empty -- and finding nothing
+                            # is not cheap: it runs to the verification read
+                            # timeout. Measured on this switch, 22.6s to learn
+                            # nothing about the AP against 1.6s for a router
+                            # that answers. Asking here and again in discovery
+                            # cost about 45s of every provision to confirm a
+                            # fact that is fixed and already known.
+                            #
+                            # Leave it unconfirmed; the MAC table below is the
+                            # only source that can actually locate the AP.
+                            driver.logger.info(
+                                f"{role}: Ubiquiti does not advertise CDP; "
+                                f"resolving from the MAC table")
+                            continue
+                        hint = "mikrotik"
                         seen, readable = None, True
                         try:
                             seen = driver.find_port_via_cdp(hint)
@@ -1583,16 +1599,17 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                     # traffic, so a quiet router stays visible where its MAC
                     # would have aged out of the forwarding table. One cheap
                     # read instead of a MAC lookup, a ping and a retry.
-                    try:
-                        cdp_hint = ("mikrotik" if ("mikrotik" in plat or "routeros" in plat)
-                                    else "ubiquiti" if ("unifi" in plat or "ubiquiti" in plat)
-                                    else peer.get("name", ""))
-                        found = driver.find_port_via_cdp(cdp_hint)
-                        if found:
-                            source = "cdp"
-                    except Exception as e:
-                        driver.logger.warning(
-                            f"CDP discovery failed for {peer.get('name')}: {e}")
+                    if not ("unifi" in plat or "ubiquiti" in plat):
+                        try:
+                            cdp_hint = ("mikrotik"
+                                        if ("mikrotik" in plat or "routeros" in plat)
+                                        else peer.get("name", ""))
+                            found = driver.find_port_via_cdp(cdp_hint)
+                            if found:
+                                source = "cdp"
+                        except Exception as e:
+                            driver.logger.warning(
+                                f"CDP discovery failed for {peer.get('name')}: {e}")
 
                     # Fall back to the MAC table for neighbours that do not
                     # speak CDP (Ubiquiti does not).

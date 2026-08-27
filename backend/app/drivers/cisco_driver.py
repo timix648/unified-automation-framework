@@ -931,6 +931,57 @@ class CiscoIOSDriver(BaseNetworkDriver):
             "timestamp": datetime.now().isoformat()
         }
     
+    def find_trunks_carrying_vlan(self, vlan_id: int) -> Optional[List[str]]:
+        """Every trunk port currently carrying this VLAN; None if unreadable.
+
+        Teardown has the opposite problem to provisioning. Provisioning must
+        work out where a device is now; teardown must find what an earlier run
+        left behind, and those are not the same set of ports -- a segment
+        provisioned before the kit was re-cabled still sits on the old one.
+        Deriving teardown from configuration therefore repeats whatever the
+        configuration got wrong, and strips a port the VLAN was never on while
+        reporting a clean removal.
+
+        Asking the switch makes it idempotent instead: whatever carries the
+        VLAN loses it, wherever it happens to be, including leftovers from
+        cycles that predate the current cabling.
+
+        Reads the "allowed and active" section for the reason given in
+        verify_trunk_carries_vlan.
+        """
+        if self.mock_mode:
+            return ["Fa0/23", "Fa0/24"]
+        out = self._read_quietly("show interfaces trunk")
+        if out is None:
+            return None
+        found, in_active_section = [], False
+        for line in out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Port"):
+                in_active_section = "allowed and active" in line
+                continue
+            if not in_active_section or not stripped:
+                continue
+            parts = stripped.split(None, 1)
+            if len(parts) != 2 or not parts[1][:1].isdigit():
+                continue
+            port, spec = parts
+            for part in spec.split(","):
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        lo, hi = (int(x) for x in part.split("-", 1))
+                    except ValueError:
+                        continue
+                    hit = lo <= vlan_id <= hi
+                else:
+                    hit = part.isdigit() and int(part) == vlan_id
+                if hit:
+                    found.append(port)
+                    break
+        self.logger.info(f"Trunks carrying VLAN {vlan_id}: {found or 'none'}")
+        return found
+
     def configure_uplink_trunk(self, port_id: str, vlan_id: int,
                                native_vlan: int = 1) -> Dict[str, Any]:
         """Make an uplink/infrastructure port a trunk CARRYING an extra VLAN,

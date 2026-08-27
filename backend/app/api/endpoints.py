@@ -1520,15 +1520,28 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                             confirmed[role] = seen
                         elif readable:
                             # The switch answered and reported no such
-                            # neighbour. That is not evidence against the
-                            # configured port -- Ubiquiti APs advertise LLDP,
-                            # not CDP, so the access point is never visible this
-                            # way. Silence is no contradiction, so take what the
-                            # operator declared and say plainly it is unverified.
-                            confirmed[role] = _configured[role]
+                            # neighbour. Ubiquiti APs advertise LLDP, not CDP,
+                            # so the access point is never visible this way.
+                            #
+                            # Silence is not agreement, though, and accepting
+                            # the configured port on the strength of it is what
+                            # let AP_UPLINK_PORT name a port the access point
+                            # was not on. The AP sat on a plain access port, so
+                            # its tagged client frames were dropped while an
+                            # unrelated port got trunked -- the SSID still came
+                            # up and the run still reported success, because
+                            # nothing ever checked. "Unverified" was logged and
+                            # was true, but a caller cannot act on a log line.
+                            #
+                            # The switch does know where the AP is: its MAC is
+                            # in the forwarding table. Leave the role
+                            # unconfirmed so discovery below reads that, rather
+                            # than assuming. Configuration is still the last
+                            # resort if the MAC cannot be found either.
                             driver.logger.info(
-                                f"{role}: no CDP neighbour to check against; using "
-                                f"configured {_configured[role]} (unverified)")
+                                f"{role}: not visible to CDP; resolving from the MAC "
+                                f"table rather than assuming configured "
+                                f"{_configured[role]}")
                         else:
                             # The switch could not be asked. Do not quietly
                             # assume the configured port is still right: that is
@@ -1545,10 +1558,16 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                         devices_to_discover = []
                     else:
                         # At least one uplink could not be settled from CDP, so
-                        # the full search still has to run. Anything already
-                        # confirmed stays; discovery fills the rest.
+                        # the full search still has to run -- but only for the
+                        # peers still outstanding. Re-walking a peer already
+                        # confirmed spends reads on a session the switch grants
+                        # roughly one of at a time.
+                        devices_to_discover = [
+                            p for p in devices if _role_of(p) not in confirmed
+                        ]
                         driver.logger.info(
-                            f"Uplinks partly resolved {uplinks}; discovering the remainder")
+                            f"Uplinks partly resolved {uplinks}; discovering "
+                            f"{[p.get('name') for p in devices_to_discover]}")
 
                 for peer in devices_to_discover:
                     plat = (peer.get("platform") or "").lower()
@@ -1559,7 +1578,7 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                             else f"{peer.get('name', 'peer')}_uplink")
                     peer_mac = (peer.get("mac_address") or peer.get("mac")
                                 or (peer.get("credentials", {}) or {}).get("mac"))
-                    found = None
+                    found, source = None, None
                     # CDP first: neighbours re-advertise every 60s regardless of
                     # traffic, so a quiet router stays visible where its MAC
                     # would have aged out of the forwarding table. One cheap
@@ -1569,6 +1588,8 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                                     else "ubiquiti" if ("unifi" in plat or "ubiquiti" in plat)
                                     else peer.get("name", ""))
                         found = driver.find_port_via_cdp(cdp_hint)
+                        if found:
+                            source = "cdp"
                     except Exception as e:
                         driver.logger.warning(
                             f"CDP discovery failed for {peer.get('name')}: {e}")
@@ -1583,6 +1604,8 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                                 peer_mac,
                                 refresh_ip=(peer.get("primary_ip") or peer.get("ip")),
                             )
+                            if found:
+                                source = "mac-table"
                         except Exception as e:
                             results["steps_failed"].append({
                                 "step": f"discover_{role}",
@@ -1594,7 +1617,8 @@ def _provision_network_impl(request: NetworkProvisionRequest, current_user: dict
                         results["steps_completed"].append({
                             "step": f"discover_{role}",
                             "device": device["name"],
-                            "result": {"mac": peer_mac, "port": found, "source": "mac-table"}
+                            "result": {"mac": peer_mac, "port": found,
+                                       "source": source or "mac-table"}
                         })
                 # Fall back to configured defaults for anything not discovered.
                 uplinks.setdefault("ap_uplink", os.getenv("AP_UPLINK_PORT", "Fa0/23"))
@@ -1924,15 +1948,45 @@ def _deprovision_network_impl(request: DeprovisionRequest, current_user: dict):
         try:
             drv = DeviceFactory.get_driver(device)
             drv.connect()
+            # Which trunks carry this VLAN has to be answered BEFORE the VLAN
+            # is deleted. The trunk table lists only VLANs that exist and are
+            # permitted, so once delete_vlan has run the segment reads as
+            # carried nowhere and the untrunk below quietly does nothing --
+            # leaving the VLAN in every allowed-list it was ever added to.
+            #
+            # Ask the switch rather than configuration: provisioning resolves
+            # uplinks live, so a segment may sit on a port configuration never
+            # named, and untrunking the configured port would strip the wrong
+            # one and strand the VLAN on the real one while reporting a clean
+            # teardown.
+            try:
+                carrying = drv.find_trunks_carrying_vlan(request.vlan_id)
+            except Exception as e:
+                carrying = None
+                drv.logger.warning(f"Could not read the trunk table: {e}")
+
             res = drv.delete_vlan(request.vlan_id, request.switch_ports)
             results["steps_completed"].append(
                 {"step": "delete_vlan", "device": device["name"], "result": res})
-            # Reverse of data-path stitching: drop this VLAN from the AP/router
-            # uplink trunks (the trunks themselves and all other VLANs remain).
-            for role, up_port in {
-                "ap_uplink": os.getenv("AP_UPLINK_PORT", "Fa0/23"),
-                "router_uplink": os.getenv("ROUTER_UPLINK_PORT", "Fa0/24"),
-            }.items():
+            # Reverse of data-path stitching: drop this VLAN from the uplink
+            # trunks (the trunks themselves and all other VLANs remain).
+
+            if carrying is None:
+                # Unreadable is not the same as empty. Fall back to the
+                # configured uplinks rather than skipping teardown silently.
+                targets = {
+                    "ap_uplink": os.getenv("AP_UPLINK_PORT", "Fa0/23"),
+                    "router_uplink": os.getenv("ROUTER_UPLINK_PORT", "Fa0/24"),
+                }
+                drv.logger.warning(
+                    "Trunk table unreadable; falling back to configured uplinks")
+            else:
+                targets = {p: p for p in carrying}
+                if not carrying:
+                    drv.logger.info(
+                        f"No trunk carries VLAN {request.vlan_id}; nothing to untrunk")
+
+            for role, up_port in targets.items():
                 try:
                     tres = drv.remove_vlan_from_trunk(up_port, request.vlan_id)
                     results["steps_completed"].append(

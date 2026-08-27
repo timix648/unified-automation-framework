@@ -480,6 +480,57 @@ class CiscoIOSDriver(BaseNetworkDriver):
             f"{description} failed: {write_error} (and the device could not be "
             f"read back to confirm)")
 
+    def is_alive(self) -> bool:
+        """Is this session still usable?
+
+        Netmiko's own check plus a transport-level test, because a session can
+        report alive while its socket is gone.
+        """
+        if self.mock_mode:
+            return True
+        if not self.connection:
+            return False
+        try:
+            if not self.connection.is_alive():
+                return False
+            tr = getattr(getattr(self.connection, "remote_conn", None), "transport", None)
+            if tr is not None and not tr.is_active():
+                return False
+            return True
+        except Exception:
+            return False
+
+    def ensure_connected(self) -> bool:
+        """Reconnect if the session has died, preserving deferred-save state.
+
+        A provisioning run holds ONE session across several phases, because this
+        switch grants about one at a time. If that session dies mid-run -- and on
+        this hardware it does -- every later step then runs against a closed
+        socket and fails, including the reads used to decide which uplink ports
+        to configure. Silently falling back to configured values at that point is
+        how an empty port gets trunked while the run still reports success.
+        Checking costs nothing when the session is healthy.
+        """
+        if self.mock_mode or self.is_alive():
+            return True
+        self.logger.warning("SSH session is no longer usable; reconnecting")
+        unsaved = self._unsaved_changes
+        try:
+            self.disconnect()
+        except Exception:
+            pass
+        self.connection = None
+        self._enable_confirmed = False
+        try:
+            ok = self.connect()
+        except Exception as e:
+            self.logger.error(f"Reconnect failed: {type(e).__name__}: {e}")
+            return False
+        # The configuration made before the session died is live on the device
+        # but still unwritten to flash; keep that pending so commit() saves it.
+        self._unsaved_changes = self._unsaved_changes or unsaved
+        return bool(ok)
+
     def _resync_channel(self) -> None:
         """Return the session to a known enable prompt after a prompt-check failure.
 
@@ -1024,6 +1075,12 @@ class CiscoIOSDriver(BaseNetworkDriver):
         if not hint:
             return None
         out = self._read_quietly("show cdp neighbors")
+        if out is None:
+            # The read itself could not be completed -- a dead session, a
+            # timeout. That is NOT the same as the switch reporting no such
+            # neighbour, and the caller must not treat it as evidence that a
+            # configured port is still correct. Say so explicitly.
+            raise ConnectionError("CDP could not be read (session unusable)")
         if not out:
             return None
         for line in out.splitlines():

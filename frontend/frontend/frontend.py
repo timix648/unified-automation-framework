@@ -179,25 +179,32 @@ class State(rx.State):
     confirm_delete_wlan: str = ""
 
     # network provisioning (admin)
-    prov_name: str = ""
-    prov_vlan: str = "20"
-    prov_subnet: str = "192.168.20.0/24"
-    prov_gateway: str = "192.168.20.1"
-    prov_ports: str = "GigabitEthernet0/1, GigabitEthernet0/2"
-    prov_ssid: str = ""
-    prov_psk: str = ""
+    #
+    # Pre-filled with the demonstration segment so provisioning is one click
+    # under time pressure; every field is still editable. The ports are
+    # FastEthernet because this switch (WS-C2960-24LT-L) has two Gigabit
+    # uplinks and 24 FastEthernet access ports -- the previous
+    # GigabitEthernet0/1-2 default named ports that do not exist on it.
+    prov_name: str = "UAF-210408501"
+    prov_vlan: str = "210"
+    prov_subnet: str = "192.168.210.0/24"
+    prov_gateway: str = "192.168.210.1"
+    prov_ports: str = "FastEthernet0/1, FastEthernet0/2, FastEthernet0/3"
+    prov_ssid: str = "UAF-210408501"
+    prov_psk: str = "Unilag210408501"
     prov_dhcp: bool = True
     prov_sec: bool = True
     prov_replace: bool = False
     prov_running: bool = False
     prov_results: List[Dict[str, Any]] = []
     prov_summary: str = ""
-    # de-provision
-    deprov_name: str = ""
-    deprov_vlan: str = ""
-    deprov_subnet: str = ""
-    deprov_ports: str = ""
-    deprov_ssid: str = ""
+    # de-provision -- same segment as the provisioning defaults above, so a
+    # tear-down and rebuild are each one click.
+    deprov_name: str = "UAF-210408501"
+    deprov_vlan: str = "210"
+    deprov_subnet: str = "192.168.210.0/24"
+    deprov_ports: str = "FastEthernet0/1, FastEthernet0/2, FastEthernet0/3"
+    deprov_ssid: str = "UAF-210408501"
     deprov_running: bool = False
     deprov_results: List[Dict[str, Any]] = []
     deprov_summary: str = ""

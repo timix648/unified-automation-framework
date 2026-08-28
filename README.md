@@ -53,6 +53,24 @@ self-service registration, appropriate for a privileged network tool. A Reflex
 operations console provides the dashboard, device inspection, provisioning,
 security, scheduling, and audit views.
 
+Uplink discovery instead of hardcoded ports. The trunk uplinks to the router and
+the access point are resolved at run time from the switch itself rather than read
+from configuration: neighbouring devices are located through CDP where they
+advertise it, and through the switch's MAC address table where they do not
+(Ubiquiti access points, for instance, do not speak CDP). A hardcoded port fails
+silently when equipment is re-cabled — the framework configures an empty port and
+still reports success — so configuration is treated as a hint and the switch is
+believed over it. This has been verified by moving all three devices to different
+ports without updating any configuration; provisioning located each of them and
+completed with every step successful.
+
+Concurrent network segments. Because the uplink to the access point is trunked
+rather than placed in a segment's VLAN, one access point serves several isolated
+networks simultaneously, each SSID tagged into its own VLAN while the access
+point keeps its own management address on the untagged VLAN. Two segments have
+been run concurrently on one access point, with clients on each receiving
+addresses from separate DHCP pools.
+
 ## Architecture
 
 ```
@@ -146,11 +164,14 @@ and Git.
 
    ```
    cd frontend
-   set API_BASE=http://localhost:8000/api
-   python -m reflex run
+   python -m reflex run --backend-port 8001
    ```
 
-   Open the console at `http://localhost:3000`.
+   Open the console at `http://localhost:3000`. The frontend defaults to a
+   backend on `http://localhost:8000/api`; set `API_BASE` only if yours differs
+   (`$env:API_BASE = "..."` in PowerShell, `export API_BASE=...` on a shell).
+   Reflex needs its own port for the state channel, which is what
+   `--backend-port` supplies; it is unrelated to the UAF API on port 8000.
 
 For a fully containerized deployment (for example on a VPS), build and start the
 whole stack from the repository root:
@@ -202,6 +223,33 @@ Configuration is supplied through `backend/.env`. A template is provided as
 `.env.example`. The key groups are system settings (including `MOCK_MODE`),
 per-vendor device addresses and credentials, the UniFi controller port and site,
 and the NetBox URL and API token. Secrets are never committed to the repository.
+
+Uplink ports may be supplied as `AP_UPLINK_PORT` and `ROUTER_UPLINK_PORT`, but
+they are a last-resort fallback rather than the mechanism: the ports are
+discovered from the switch, and a stale value is detected and overridden rather
+than obeyed.
+
+## Known constraints
+
+These are properties of the equipment rather than defects in the framework, but
+they shape what to expect when running it against hardware of this vintage.
+
+The Catalyst 2960 grants approximately one usable SSH session at a time, so
+provisioning holds a single session across all its phases, and an administrative
+operation issued while a scheduled scan is still running will spend time
+recovering the session before it can proceed. Pausing background jobs prevents
+new ones from starting but cannot recall a scan already in progress.
+
+Timings vary with the switch rather than with the work. A full provisioning run
+across all three vendors has been measured between 73 and 140 seconds, and
+de-provisioning between 45 and 68 seconds, for identical operations. Every read
+and connect timeout is configurable through the environment so the same code can
+run on a local network or across a high-latency link.
+
+The switch's SSH implementation predates the algorithms modern client libraries
+negotiate by default, and the RouterOS installation uses the login exchange
+superseded at version 6.43. Both are handled in the drivers at run time, so
+neither device needs a firmware upgrade in order to be managed.
 
 ## Security notes
 
